@@ -1,0 +1,18 @@
+[package]
+name = "sund-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sund-core = { path = "../../crates/sund-core" }
+sund-bind = { path = "../../crates/sund-bind" }
+
+[[bin]]
+name = "sund_bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

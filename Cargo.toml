@@ -1,15 +1,25 @@
-[package]
-name = "sund"
+[workspace]
+resolver = "2"
+members = [
+    "crates/sund-core",
+    "crates/sund-stream",
+    "crates/sund-bind",
+    "crates/sund-derive",
+    "sund",
+    "benches/sund-bench",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Sund is a suspendable json parser core that unifies buffered and streaming JSON decoding."
 authors = ["penglei"]
 license = "MIT"
-repository = "https://github.com/velox-io/sund-rs"
-homepage = "https://github.com/velox-io/sund-rs"
-documentation = "https://docs.rs/sund"
-keywords = ["json", "parser", "streaming", "async"]
+repository = "https://github.com/penglei/sund-rs"
+homepage = "https://github.com/penglei/sund-rs"
+keywords = ["json", "parser", "streaming", "simd"]
 categories = ["encoding", "parser-implementations"]
-readme = "README.md"
 
-[dependencies]
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

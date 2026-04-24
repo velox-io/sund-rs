@@ -1,0 +1,19 @@
+[package]
+name = "sund"
+description = "Sund is a suspendable JSON parser that unifies buffered and streaming decoding with SIMD acceleration."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+
+[features]
+default = ["stream", "bind"]
+stream = ["sund-stream"]
+bind = ["sund-bind"]
+
+[dependencies]
+sund-core = { path = "../crates/sund-core" }
+sund-stream = { path = "../crates/sund-stream", optional = true }
+sund-bind = { path = "../crates/sund-bind", optional = true }

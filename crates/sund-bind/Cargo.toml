@@ -1,0 +1,11 @@
+[package]
+name = "sund-bind"
+description = "Schema-driven JSON unmarshal on top of the sund parsing kernel."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sund-core = { path = "../sund-core" }

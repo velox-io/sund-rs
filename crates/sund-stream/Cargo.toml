@@ -1,0 +1,11 @@
+[package]
+name = "sund-stream"
+description = "Suspend/resume stream driver for the sund JSON parser."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sund-core = { path = "../sund-core" }
