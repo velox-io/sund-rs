@@ -3,13 +3,21 @@
 //! Produces 64-bit structural bitmaps from 64-byte input chunks.
 //! Algorithm: classify → escape resolution → string mask → merge.
 //!
-//! - aarch64: NEON + PMULL (crypto extension for prefix_xor)
-//! - x86-64:  AVX2 + PCLMULQDQ
-//! - fallback: scalar byte-by-byte classification
+//! Platform selection uses `cfg(target_feature)` at the module level so
+//! that platform-specific files contain **no** per-function
+//! `#[target_feature]` annotations — every function can be
+//! `#[inline(always)]` without conflict.
+//!
+//! - aarch64:                NEON + PMULL  (neon.rs)
+//! - x86-64 with avx2 flag: AVX2 + PCLMULQDQ (avx2.rs)
+//! - everything else:       scalar fallback  (generic.rs)
+//!
+//! To enable the AVX2 path, compile with `-C target-feature=+avx2,+pclmulqdq`
+//! or `-C target-cpu=native`.
 
 use crate::types::ScanState;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_feature = "avx2")]
 mod avx2;
 mod generic;
 #[cfg(target_arch = "aarch64")]
@@ -69,9 +77,38 @@ pub fn clear_lowest_bit(v: u64) -> u64 {
 /// `true` if `v` was zero (empty bitmap).
 ///
 /// On x86-64 with BMI1, `tzcnt` sets CF=1 exactly when the source is 0,
-/// giving one fewer instruction than `test + tzcnt`.  The Rust
-/// `trailing_zeros()` intrinsic already compiles to `tzcnt` on modern
-/// targets and returns 64 for zero input.
+/// giving one fewer instruction than `test + tzcnt`. The Rust
+/// `trailing_zeros()` intrinsic compiles to `tzcnt` on modern targets
+/// and returns 64 for zero input.
+///
+/// We tried three routes to recover the C reference's `tzcnt + jc` form
+/// (~12 ns/iter on the 1332-byte payload, theoretically):
+///
+/// 1. Stable `asm!("tzcnt; setc", ...)` returning a `bool` — opaque
+///    to LLVM, defeats CSE/DCE, static tzcnt count grew 30 → 75, base
+///    regressed 476 → 516 ns.
+/// 2. Nightly `asm_goto_with_outputs` jumping to a `return true`
+///    block — emits the right `tzcnt + jb`, but LLVM lowers the
+///    `callbr` IR pessimistically: it spills 4–5 callee-save
+///    registers into the stack frame *before each* tzcnt site to
+///    pin live-out values across the unknown branch. Static rsp
+///    movs grew ~500 → 661, base regressed 476 → 553 ns.
+/// 3. `naked_asm!`/extern "C" wrapper — eliminates LLVM optimiser
+///    pessimisation around the asm, but turns the inlined helper into
+///    an ABI call. Returning a Rust `bool` through `al` forces the
+///    caller into `call + test al,al + jne` (3 insns), which is
+///    *worse* than the current portable form's `test + je + tzcnt`
+///    (also 3 insns) because it adds a real call/ret. CF cannot be
+///    propagated across a function boundary in System V x86-64 ABI.
+///
+/// **The optimisation is structurally unreachable from Rust** until
+/// LLVM grows `"=@ccc"`-style flag outputs for `asm!` (issue
+/// rust-lang/rust#101019 family). For reference, clang has the same
+/// limitation: written in C without the GCC `__asm__("=@ccc")`
+/// extension, the equivalent code generates the identical 3-instruction
+/// `test; je; tzcnt` sequence — ndec is fast specifically because it
+/// hand-writes inline asm, not because C compilers fold the pattern
+/// automatically.
 #[inline(always)]
 pub fn ctz64_empty(v: u64, out_idx: &mut u32) -> bool {
     *out_idx = v.trailing_zeros();
@@ -93,13 +130,13 @@ pub fn prefix_xor(v: u64) -> u64 {
         // Silicon; compile with +aes on other aarch64 targets).
         unsafe { neon::prefix_xor_neon(v) }
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_feature = "avx2")]
     {
-        // SAFETY: On x86-64 we require PCLMULQDQ + SSE2. The caller must
-        // ensure the target supports these features (universal since ~2010).
+        // SAFETY: PCLMULQDQ + SSE2 required. Compile with
+        // -C target-feature=+avx2,+pclmulqdq or -C target-cpu=native.
         unsafe { avx2::prefix_xor_x86(v) }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(any(target_arch = "aarch64", target_feature = "avx2")))]
     {
         generic::prefix_xor_generic(v)
     }
@@ -117,11 +154,11 @@ pub unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
     {
         neon::classify_chunk(buf)
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_feature = "avx2")]
     {
         avx2::classify_chunk(buf)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(any(target_arch = "aarch64", target_feature = "avx2")))]
     {
         generic::classify_chunk(buf)
     }
@@ -175,9 +212,22 @@ pub unsafe fn scan_chunk(buf: *const u8, state: &mut ScanState) -> ChunkResult {
     let cls = classify_chunk(buf);
 
     // Fast path: most chunks have no backslashes.
+    //
+    // Cross-chunk escape carry: when the previous chunk ended with a
+    // live backslash (prev_escape == 1), bit 0 of the current chunk's
+    // quote bitmap is an escaped character (e.g. `\"` straddling the
+    // boundary), not a real quote.  On the fast path (no backslashes),
+    // `compute_escaped` is skipped so we must mask the carry manually.
+    // On the slow path, `compute_escaped` already folds `prev_escape`
+    // into `escaped` via `escaped = ... ^ (backslash | prev_escape)`.
     let real_quotes = if cls.backslash == 0 {
-        state.prev_escape = 0;
-        cls.raw_quote
+        let rq = cls.raw_quote;
+        if state.prev_escape != 0 {
+            state.prev_escape = 0;
+            rq & !1u64
+        } else {
+            rq
+        }
     } else {
         let esc = compute_escaped(cls.backslash, state);
         cls.raw_quote & !esc.escaped
@@ -238,10 +288,6 @@ pub unsafe fn advance_chunk_tail(
 /// When `!is_final` and remaining < 64, returns the input `chunk_ptr`
 /// unchanged with `bits = 0`, signalling resume-needed.  `is_final` is
 /// read from `state.is_final`.
-///
-/// `#[inline(never)]` is deliberate: the parser calls this from many sites
-/// in the state machine, and inlining the full SIMD `scan_chunk` body at
-/// each one bloats the parser and causes a net hot-path regression.
 ///
 /// # Safety
 ///

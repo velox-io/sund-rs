@@ -2,12 +2,15 @@
 //!
 //! Uses a shuffle-LUT approach for byte classification.
 //! Also provides `prefix_xor_x86` via PCLMULQDQ (carry-less multiply).
+//!
+//! This entire module is gated by `cfg(target_feature = "avx2")` at the
+//! import site (`scanner/mod.rs`).  No per-function `#[target_feature]`
+//! is needed — the compiler already knows AVX2/PCLMULQDQ are available,
+//! so `#[inline(always)]` works without conflict.
 
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use super::ChunkClass;
-
-#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
 /// Compute prefix-XOR using `_mm_clmulepi64_si128` (PCLMULQDQ).
@@ -18,8 +21,7 @@ use core::arch::x86_64::*;
 /// # Safety
 ///
 /// Requires x86-64 with SSE2 and PCLMULQDQ support.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2,pclmulqdq")]
+#[inline(always)]
 pub(crate) unsafe fn prefix_xor_x86(v: u64) -> u64 {
     let x = _mm_set_epi64x(0, v as i64);
     let ones = _mm_set_epi64x(0, -1i64);
@@ -33,8 +35,7 @@ pub(crate) unsafe fn prefix_xor_x86(v: u64) -> u64 {
 ///
 /// `buf` must point to at least 64 readable bytes.
 /// Requires x86-64 with AVX2 support.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[inline(always)]
 pub(crate) unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
     let v0 = _mm256_loadu_si256(buf as *const __m256i);
     let v1 = _mm256_loadu_si256(buf.add(32) as *const __m256i);

@@ -292,20 +292,135 @@ fn bench_parse(json: &[u8]) {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let run_base = args.iter().any(|a| a == "base") || (!args.iter().any(|a| a == "parse"));
-    let run_parse = args.iter().any(|a| a == "parse") || (!args.iter().any(|a| a == "base"));
+    let run_base = args.iter().any(|a| a == "base") || (!args.iter().any(|a| a == "parse" || a == "minimal"));
+    let run_parse = args.iter().any(|a| a == "parse") || (!args.iter().any(|a| a == "base" || a == "minimal"));
+    let run_minimal = args.iter().any(|a| a == "minimal");
 
     let (json, path) = load_payload();
     eprintln!("sund_bench: loaded {} bytes from {}", json.len(), path);
 
     if run_base {
         bench_base(&json);
-        if run_parse {
+        if run_parse || run_minimal {
             println!();
         }
     }
 
     if run_parse {
         bench_parse(&json);
+        if run_minimal {
+            println!();
+        }
     }
+
+    if run_minimal {
+        bench_minimal(&json);
+    }
+}
+
+
+/// Minimal reactor for measuring dispatch overhead.
+struct MinimalReactor {
+    count: u32,
+}
+
+impl MinimalReactor {
+    fn new() -> Self {
+        Self { count: 0 }
+    }
+
+    fn reset(&mut self) {
+        self.count = 0;
+    }
+}
+
+impl Reactor for MinimalReactor {
+    #[inline(always)]
+    fn begin_object(&mut self) -> i32 {
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn end_object(&mut self) -> i32 {
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn object_field(&mut self, _key: StrInfo<'_>) -> i32 {
+        self.count += 1;
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn begin_array(&mut self) -> i32 {
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn end_array(&mut self) -> i32 {
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn array_elem(&mut self) -> i32 {
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn scalar_null(&mut self) -> i32 {
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn scalar_bool(&mut self, _value: bool) -> i32 {
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn scalar_number(&mut self, _raw: RawStr<'_>) -> i32 {
+        PROCEED
+    }
+
+    #[inline(always)]
+    fn scalar_string(&mut self, _s: StrInfo<'_>) -> i32 {
+        PROCEED
+    }
+}
+
+fn bench_minimal(json: &[u8]) {
+    let json_len = json.len();
+    let iterations = get_iterations(json_len);
+
+    eprintln!("JSON payload size: {} bytes", json_len);
+    eprintln!("Running {} iterations (MINIMAL reactor)...", iterations);
+
+    let mut reactor = MinimalReactor::new();
+
+    // Warmup
+    for _ in 0..1000 {
+        reactor.reset();
+        let mut ctx = Ctx::new();
+        ctx.set_input_slice(json, true);
+        unsafe { parser::parse(&mut ctx, &mut reactor) };
+    }
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        reactor.reset();
+        let mut ctx = Ctx::new();
+        ctx.set_input_slice(json, true);
+        unsafe { parser::parse(&mut ctx, &mut reactor) };
+    }
+    let elapsed = start.elapsed();
+
+    let ns_per_iter = elapsed.as_nanos() as f64 / iterations as f64;
+    let mb_per_sec = json_len as f64 * iterations as f64 / elapsed.as_secs_f64() / 1e6;
+    let gb_per_sec = mb_per_sec / 1000.0;
+
+    eprintln!("Done.\n");
+    println!("sund minimal (dispatch-only callbacks):");
+    println!("  {} iterations, {} bytes each", iterations, json_len);
+    println!("  {:.1} ns/iter", ns_per_iter);
+    println!("  {:.1} MB/s ({:.2} GB/s)", mb_per_sec, gb_per_sec);
+    eprintln!("reactor.count={}", reactor.count);
 }
