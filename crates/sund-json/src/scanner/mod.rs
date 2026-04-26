@@ -216,13 +216,20 @@ pub fn compute_escaped(backslash: u64, state: &mut ScanState) -> EscapeResult {
 pub unsafe fn scan_chunk(buf: *const u8, state: &mut ScanState) -> ChunkResult {
     let cls = classify_chunk(buf);
 
+    // Consume cross-chunk escape carry.  When the previous chunk ended
+    // with a live backslash (prev_escape == 1), bit 0 of the current
+    // chunk's quote bitmap is an escaped character, not a real quote.
+    // We mask it out branchlessly: `prev_escape` is 0 or 1 so
+    // `!prev_escape` is ~0 or ~1, clearing only bit 0 when needed.
+    let raw_quote_adj = cls.raw_quote & !state.prev_escape;
+
     // Fast path: most chunks have no backslashes.
     let real_quotes = if cls.backslash == 0 {
         state.prev_escape = 0;
-        cls.raw_quote
+        raw_quote_adj
     } else {
         let esc = compute_escaped(cls.backslash, state);
-        cls.raw_quote & !esc.escaped
+        raw_quote_adj & !esc.escaped
     };
 
     let in_string = prefix_xor(real_quotes) ^ state.prev_in_string;
