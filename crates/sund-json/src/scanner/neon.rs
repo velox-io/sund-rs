@@ -1,6 +1,6 @@
 //! NEON implementation of chunk classification for aarch64.
 //!
-//! Uses the dual-class split-nibble LUT approach from the C scanner.
+//! Uses a dual-class split-nibble LUT approach for byte classification.
 //! Also provides `prefix_xor_neon` via PMULL (polynomial multiply).
 //!
 //! Note: `#[target_feature]` is NOT used on these functions so that they
@@ -16,10 +16,6 @@ use super::ChunkClass;
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 
-// ---------------------------------------------------------------------------
-// prefix_xor via PMULL (carry-less multiply)
-// ---------------------------------------------------------------------------
-
 /// Compute prefix-XOR using `vmull_p64` (PMULL crypto extension).
 ///
 /// # Safety
@@ -32,10 +28,6 @@ pub(crate) unsafe fn prefix_xor_neon(v: u64) -> u64 {
     let r = vmull_p64(v, !0u64);
     vgetq_lane_u64(vreinterpretq_u64_p128(r), 0)
 }
-
-// ---------------------------------------------------------------------------
-// Pack four 16-byte comparison masks into a single 64-bit bitmap.
-// ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -79,10 +71,6 @@ unsafe fn pack_mask64(m0: uint8x16_t, m1: uint8x16_t, m2: uint8x16_t, m3: uint8x
     );
     result
 }
-
-// ---------------------------------------------------------------------------
-// classify_chunk: 64 bytes → ChunkClass
-// ---------------------------------------------------------------------------
 
 /// Classify 64 input bytes using NEON split-nibble LUTs.
 ///

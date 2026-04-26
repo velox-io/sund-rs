@@ -1,6 +1,4 @@
 //! Fast JSON number parser (Clinger's fast path).
-//!
-//! Ported from `ndec/impl/number.h`.
 
 /// Precomputed 10^0..10^22 (exact in binary64).
 static POW10: [f64; 23] = [
@@ -156,7 +154,6 @@ pub fn parse_double(src: &[u8]) -> Result<f64, ()> {
         }
     }
 
-    // Fallback.
     let mut d = parse_double_fallback(src);
     if neg && d > 0.0 {
         d = -d;

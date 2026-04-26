@@ -1,22 +1,16 @@
-//! Thin suspend/resume driver around `sund_core::kernel::parse`.
+//! Thin suspend/resume stream driver around the JSON parser.
 //!
-//! `Stream` wraps the kernel's suspend/resume loop, feeding segments of a byte
-//! stream one at a time. Each `feed()` call pushes the kernel forward until
+//! `Stream` wraps the parser's suspend/resume loop, feeding segments of a byte
+//! stream one at a time. Each `feed()` call pushes the parser forward until
 //! "input exhausted / top-level value complete / error", then returns
 //! `DONE` / `NEED_MORE` / `ERROR`.
 //!
 //! On `NEED_MORE`, the caller must relocate `[tail, tail+tail_len)` to the
 //! start of the next buffer and append new bytes after it.
-//!
-//! Ported from `ndec/impl/stream.h`.
 
-use sund_core::kernel;
-use sund_core::reactor::Reactor;
-use sund_core::types::{Ctx, ExitCode};
-
-// ---------------------------------------------------------------------------
-// StreamStatus
-// ---------------------------------------------------------------------------
+use crate::parser;
+use crate::reactor::Reactor;
+use crate::types::{Ctx, ExitCode};
 
 /// Status returned by `Stream::feed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,20 +23,12 @@ pub enum StreamStatus {
     Error = 2,
 }
 
-// ---------------------------------------------------------------------------
-// Flag bits
-// ---------------------------------------------------------------------------
-
 const F_DONE: u32 = 0x01;
 const F_ERROR: u32 = 0x02;
 
-// ---------------------------------------------------------------------------
-// Stream
-// ---------------------------------------------------------------------------
-
-/// Streaming JSON parser wrapping the sund kernel.
+/// Streaming JSON parser wrapping the sund parser.
 ///
-/// The stream owns a `Ctx` and drives the kernel's suspend/resume cycle.
+/// The stream owns a `Ctx` and drives the parser's suspend/resume cycle.
 /// Call `feed()` repeatedly with buffer segments; on `NeedMore`, move the
 /// unconsumed tail to the front of your next buffer.
 pub struct Stream {
@@ -97,7 +83,6 @@ impl Stream {
 
         let ctx = &mut self.ctx;
 
-        // Reset per-feed scanner cursor to the start of the new buffer.
         ctx.cur_pos = data.as_ptr();
         ctx.chunk_ptr = data.as_ptr();
         ctx.structural_bits = 0;
@@ -106,13 +91,12 @@ impl Stream {
         ctx.scan_state.prev_structural_or_ws = 1;
         ctx.set_input_slice(data, is_final);
 
-        // Drive the kernel.
-        unsafe { kernel::parse(ctx, reactor) };
+        // SAFETY: ctx was initialised via Ctx::new() and input set via set_input_slice() above.
+        unsafe { parser::parse(ctx, reactor) };
 
         let data_ptr = data.as_ptr();
         let data_end = unsafe { data_ptr.add(data.len()) };
         let mut cur = ctx.cur_pos;
-        // Clamp cur to [data_ptr, data_end].
         if cur < data_ptr {
             cur = data_ptr;
         }

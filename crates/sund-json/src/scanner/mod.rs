@@ -3,8 +3,6 @@
 //! Produces 64-bit structural bitmaps from 64-byte input chunks.
 //! Algorithm: classify → escape resolution → string mask → merge.
 //!
-//! Ported from `ndec/impl/scanner.h`.
-//!
 //! - aarch64: NEON + PMULL (crypto extension for prefix_xor)
 //! - x86-64:  AVX2 + PCLMULQDQ
 //! - fallback: scalar byte-by-byte classification
@@ -16,10 +14,6 @@ mod avx2;
 mod generic;
 #[cfg(target_arch = "aarch64")]
 mod neon;
-
-// ---------------------------------------------------------------------------
-// Data structures
-// ---------------------------------------------------------------------------
 
 /// Per-chunk classification bitmaps (one bit per input byte, 64 bits = 64 bytes).
 #[derive(Clone, Copy, Debug)]
@@ -65,10 +59,6 @@ pub struct AdvanceResult2 {
     pub bits: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Bit-manipulation helpers
-// ---------------------------------------------------------------------------
-
 /// Clear the lowest set bit (corresponds to x86 BLSR).
 #[inline(always)]
 pub fn clear_lowest_bit(v: u64) -> u64 {
@@ -87,11 +77,6 @@ pub fn ctz64_empty(v: u64, out_idx: &mut u32) -> bool {
     *out_idx = v.trailing_zeros();
     v == 0
 }
-
-// ---------------------------------------------------------------------------
-// prefix_xor: bit i of result = XOR of bits 0..i of input.
-// Converts quote positions into in-string mask.
-// ---------------------------------------------------------------------------
 
 /// Compute the prefix-XOR of a 64-bit value.
 ///
@@ -120,10 +105,6 @@ pub fn prefix_xor(v: u64) -> u64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Chunk classification dispatch
-// ---------------------------------------------------------------------------
-
 /// Classify 64 input bytes into four bitmaps: backslash, raw_quote,
 /// whitespace, and structural operators.
 ///
@@ -145,10 +126,6 @@ pub unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
         generic::classify_chunk(buf)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Escape resolution (simdjson subtraction algorithm)
-// ---------------------------------------------------------------------------
 
 /// Escape resolution using simdjson's ODD_BITS subtraction algorithm.
 ///
@@ -186,10 +163,6 @@ pub fn compute_escaped(backslash: u64, state: &mut ScanState) -> EscapeResult {
 
     EscapeResult { escaped }
 }
-
-// ---------------------------------------------------------------------------
-// scan_chunk: classify + string mask + structural merge
-// ---------------------------------------------------------------------------
 
 /// Scan a single 64-byte chunk: classify bytes, resolve escapes, compute
 /// the in-string mask, and merge into a structural bitmap.
@@ -231,14 +204,6 @@ pub unsafe fn scan_chunk(buf: *const u8, state: &mut ScanState) -> ChunkResult {
         backslash: cls.backslash,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Chunk advancement
-//
-// advance_chunk scans chunk_ptr+64 (the NEXT chunk).  The very first chunk
-// must be scanned separately at parse entry (bootstrap), since advance_chunk
-// cannot scan the current position.
-// ---------------------------------------------------------------------------
 
 /// Cold path: `remaining < 64` and `is_final`.  Pads the tail chunk in a
 /// scratch buffer and scans it.  Split out so the hot path doesn't pay for
@@ -340,10 +305,7 @@ pub unsafe fn advance_chunk_outlined(
 
     if remaining <= 0 || !state.is_final {
         *bs_out = 0;
-        return AdvanceResult2 {
-            chunk_ptr,
-            bits: 0,
-        };
+        return AdvanceResult2 { chunk_ptr, bits: 0 };
     }
 
     let ar = advance_chunk_tail(next, remaining, state);

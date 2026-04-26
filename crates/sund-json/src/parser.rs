@@ -1,11 +1,8 @@
 //! Computed-goto JSON parser state machine.
 //!
-//! Ported from `ndec/impl/ndec.h`.
-//!
-//! On aarch64, the dispatch uses a real computed-goto via `asm_goto`: a
-//! 4-instruction jump table (adr + ldrsw + add + br), matching the C
-//! version exactly. On other architectures, falls back to a dense 9-arm
-//! `match` with `unreachable_unchecked()`.
+//! On aarch64 and x86_64, the dispatch uses a real computed-goto via
+//! `asm_goto` (4-instruction jump table). On other architectures, falls
+//! back to a dense 9-arm `match` with `unreachable_unchecked()`.
 
 use crate::reactor::Reactor;
 use crate::scalar::{
@@ -17,7 +14,6 @@ use crate::types::*;
 /// Sentinel for end-of-input within the structural bitmap scan.
 const EOF: i32 = -1;
 
-// Phase integer constants — match Phase enum discriminants.
 const PH_ROOT_VALUE: u32 = 0;
 const PH_OBJ_FIELD_OR_END: u32 = 1;
 const PH_OBJ_FIELD_VALUE: u32 = 2;
@@ -32,8 +28,9 @@ const PH_SKIP_VALUE: u32 = 8;
 ///
 /// # Safety
 ///
-/// The pointers stored in `ctx` (`buf`, `buf_end`, `cur_pos`, `chunk_ptr`)
-/// must be valid for reads within the input buffer.
+/// The caller must ensure `ctx` was initialised via [`Ctx::new`] and its input
+/// buffer set via [`Ctx::set_input_slice`] (or [`Ctx::set_input`] with valid
+/// pointers).
 pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
     let buf = ctx.buf;
     let buf_end = ctx.buf_end;
@@ -44,10 +41,6 @@ pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
     let mut scan_state = ctx.scan_state;
     let mut depth = ctx.depth;
     let frames = ctx.frames.as_mut_ptr();
-
-    // ------------------------------------------------------------------
-    // Inline macro equivalents
-    // ------------------------------------------------------------------
 
     macro_rules! cur_offset {
         () => {
@@ -252,10 +245,6 @@ pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
         };
     }
 
-    // ------------------------------------------------------------------
-    // Bootstrap
-    // ------------------------------------------------------------------
-
     let initial_phase: u32;
 
     if depth != 0 {
@@ -299,15 +288,787 @@ pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
         initial_phase = PH_ROOT_VALUE;
     }
 
-    // ------------------------------------------------------------------
-    // Main dispatch loop — dense 9-entry jump table
-    // ------------------------------------------------------------------
-
     let mut current_phase = initial_phase;
 
     'dispatch: loop {
+        macro_rules! phase_root_value {
+            () => {{
+                let ch = next_structural!();
+                if ch == b'{' as i32 {
+                    top_frame!().phase = PH_ROOT_DONE;
+                    stack_push!(PH_OBJ_FIELD_OR_END);
+                    let d = reactor.begin_object();
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
+                    }
+                    current_phase = PH_OBJ_FIELD_OR_END;
+                    continue 'dispatch;
+                }
+                if ch == b'[' as i32 {
+                    top_frame!().phase = PH_ROOT_DONE;
+                    stack_push!(PH_ARR_ELEM_OR_END);
+                    let d = reactor.begin_array();
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
+                    }
+                    current_phase = PH_ARR_ELEM_OR_END;
+                    continue 'dispatch;
+                }
+                if ch == EOF {
+                    if (scan_state).is_final {
+                        error_exit!(
+                            ExitCode::ErrEof as i32,
+                            (buf_end as usize - buf as usize) as u32
+                        );
+                    }
+                    suspend_next!(PH_ROOT_VALUE);
+                }
+                // Root scalar (rare), inlined without sentinel phase.
+                let ch = *cur_pos as i32;
+                if ch == b'"' as i32 {
+                    let str_start = cur_pos.add(1);
+                    let sr = string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
+                    bits = sr.bits;
+                    chunk_ptr = sr.chunk_ptr;
+                    bs_bits = sr.backslash;
+                    if sr.status != SpanStatus::Ok {
+                        if sr.status == SpanStatus::Truncated {
+                            suspend_here!(PH_ROOT_VALUE);
+                        }
+                        error_exit!(ExitCode::ErrEof as i32, cur_offset!());
+                    }
+                    let si = StrInfo {
+                        raw: RawStr::new(str_start, (sr.end as usize - str_start as usize) as u32),
+                        has_escape: sr.has_escape,
+                    };
+                    cur_pos = sr.end.add(1);
+                    let d = reactor.scalar_string(si);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ROOT_DONE);
+                    }
+                    current_phase = PH_ROOT_DONE;
+                    continue 'dispatch;
+                }
+                if ch == b'n' as i32 {
+                    match_keyword!(match_null, 4, PH_ROOT_VALUE);
+                    let d = reactor.scalar_null();
+                    if d < 0 {
+                        yield_or_error!(d, PH_ROOT_DONE);
+                    }
+                    current_phase = PH_ROOT_DONE;
+                    continue 'dispatch;
+                }
+                if ch == b't' as i32 {
+                    match_keyword!(match_true, 4, PH_ROOT_VALUE);
+                    let d = reactor.scalar_bool(true);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ROOT_DONE);
+                    }
+                    current_phase = PH_ROOT_DONE;
+                    continue 'dispatch;
+                }
+                if ch == b'f' as i32 {
+                    match_keyword!(match_false, 5, PH_ROOT_VALUE);
+                    let d = reactor.scalar_bool(false);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ROOT_DONE);
+                    }
+                    current_phase = PH_ROOT_DONE;
+                    continue 'dispatch;
+                }
+                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
+                    let num_start = cur_pos;
+                    parse_number_span!(end, PH_ROOT_VALUE, num_start);
+                    let raw = RawStr::new(num_start, (end as usize - num_start as usize) as u32);
+                    cur_pos = end;
+                    let d = reactor.scalar_number(raw);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ROOT_DONE);
+                    }
+                    current_phase = PH_ROOT_DONE;
+                    continue 'dispatch;
+                }
+                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+            }};
+        }
+
+        macro_rules! phase_obj_field_or_end {
+            () => {{
+                let ch = next_structural!();
+                if ch == b'"' as i32 {
+                    let quote_pos = cur_pos;
+                    let key_start = cur_pos.add(1);
+                    parse_string_span!(end, has_esc, PH_OBJ_FIELD_OR_END, quote_pos);
+                    let colon = next_structural!();
+                    if colon != b':' as i32 {
+                        if colon == EOF {
+                            suspend_at!(PH_OBJ_FIELD_OR_END, quote_pos);
+                        }
+                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+                    }
+                    let key = StrInfo {
+                        raw: RawStr::new(key_start, (end as usize - key_start as usize) as u32),
+                        has_escape: has_esc,
+                    };
+                    let d = reactor.object_field(key);
+                    if d != PROCEED {
+                        if d == SKIP {
+                            top_frame!().phase = PH_OBJ_CONTINUE;
+                            top_frame!().data = 0;
+                            current_phase = PH_SKIP_VALUE;
+                            continue 'dispatch;
+                        }
+                        yield_or_error!(d, PH_OBJ_FIELD_VALUE);
+                    }
+                    current_phase = PH_OBJ_FIELD_VALUE;
+                    continue 'dispatch;
+                }
+                if ch == b'}' as i32 {
+                    cur_pos = cur_pos.add(1);
+                    stack_pop!();
+                    let d = reactor.end_object();
+                    if d < 0 {
+                        yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
+                    }
+                    current_phase = (*frames.add(depth as usize - 1)).phase;
+                    continue 'dispatch;
+                }
+                if ch == EOF {
+                    suspend_next!(PH_OBJ_FIELD_OR_END);
+                }
+                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+            }};
+        }
+
+        macro_rules! phase_obj_field_value {
+            () => {{
+                let ch = next_structural!();
+                if ch == b'"' as i32 {
+                    let vb = cur_pos;
+                    let ss = cur_pos.add(1);
+                    parse_string_span!(end, he, PH_OBJ_FIELD_VALUE, vb);
+                    let si = StrInfo {
+                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
+                        has_escape: he,
+                    };
+                    cur_pos = end.add(1);
+                    let d = reactor.scalar_string(si);
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_CONTINUE);
+                    }
+                    current_phase = PH_OBJ_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
+                    let ns = cur_pos;
+                    parse_number_span!(end, PH_OBJ_FIELD_VALUE, ns);
+                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
+                    cur_pos = end;
+                    let d = reactor.scalar_number(raw);
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_CONTINUE);
+                    }
+                    current_phase = PH_OBJ_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'{' as i32 {
+                    top_frame!().phase = PH_OBJ_CONTINUE;
+                    stack_push!(PH_OBJ_FIELD_OR_END);
+                    let d = reactor.begin_object();
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
+                    }
+                    current_phase = PH_OBJ_FIELD_OR_END;
+                    continue 'dispatch;
+                }
+                if ch == b'[' as i32 {
+                    top_frame!().phase = PH_OBJ_CONTINUE;
+                    stack_push!(PH_ARR_ELEM_OR_END);
+                    let d = reactor.begin_array();
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
+                    }
+                    current_phase = PH_ARR_ELEM_OR_END;
+                    continue 'dispatch;
+                }
+                if ch == b'n' as i32 {
+                    match_keyword!(match_null, 4, PH_OBJ_FIELD_VALUE);
+                    let d = reactor.scalar_null();
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_CONTINUE);
+                    }
+                    current_phase = PH_OBJ_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b't' as i32 {
+                    match_keyword!(match_true, 4, PH_OBJ_FIELD_VALUE);
+                    let d = reactor.scalar_bool(true);
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_CONTINUE);
+                    }
+                    current_phase = PH_OBJ_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'f' as i32 {
+                    match_keyword!(match_false, 5, PH_OBJ_FIELD_VALUE);
+                    let d = reactor.scalar_bool(false);
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_CONTINUE);
+                    }
+                    current_phase = PH_OBJ_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == EOF {
+                    suspend_next!(PH_OBJ_FIELD_VALUE);
+                }
+                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+            }};
+        }
+
+        macro_rules! phase_obj_continue {
+            () => {{
+                'obj_loop: loop {
+                    let ch = next_structural!();
+                    if ch == b',' as i32 {
+                        let comma_pos = cur_pos;
+                        let nch = next_structural!();
+                        if nch == EOF {
+                            suspend_at!(PH_OBJ_CONTINUE, comma_pos);
+                        }
+                        if nch != b'"' as i32 {
+                            error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+                        }
+                        let key_start = cur_pos.add(1);
+                        parse_string_span!(end, has_esc, PH_OBJ_CONTINUE, comma_pos);
+                        let colon = next_structural!();
+                        if colon != b':' as i32 {
+                            if colon == EOF {
+                                suspend_at!(PH_OBJ_CONTINUE, comma_pos);
+                            }
+                            error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+                        }
+                        let key = StrInfo {
+                            raw: RawStr::new(key_start, (end as usize - key_start as usize) as u32),
+                            has_escape: has_esc,
+                        };
+                        let d = reactor.object_field(key);
+                        if d != PROCEED {
+                            if d == SKIP {
+                                top_frame!().phase = PH_OBJ_CONTINUE;
+                                top_frame!().data = 0;
+                                current_phase = PH_SKIP_VALUE;
+                                continue 'dispatch;
+                            }
+                            yield_or_error!(d, PH_OBJ_FIELD_VALUE);
+                        }
+                        let ch = next_structural!();
+                        if ch == b'"' as i32 {
+                            let vb = cur_pos;
+                            let ss = cur_pos.add(1);
+                            parse_string_span!(vend, he, PH_OBJ_FIELD_VALUE, vb);
+                            let si = StrInfo {
+                                raw: RawStr::new(ss, (vend as usize - ss as usize) as u32),
+                                has_escape: he,
+                            };
+                            cur_pos = vend.add(1);
+                            let d = reactor.scalar_string(si);
+                            if d < 0 {
+                                yield_or_error!(d, PH_OBJ_CONTINUE);
+                            }
+                            continue 'obj_loop;
+                        }
+                        if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
+                            let ns = cur_pos;
+                            parse_number_span!(vend, PH_OBJ_FIELD_VALUE, ns);
+                            let raw = RawStr::new(ns, (vend as usize - ns as usize) as u32);
+                            cur_pos = vend;
+                            let d = reactor.scalar_number(raw);
+                            if d < 0 {
+                                yield_or_error!(d, PH_OBJ_CONTINUE);
+                            }
+                            continue 'obj_loop;
+                        }
+                        if ch == b'{' as i32 {
+                            top_frame!().phase = PH_OBJ_CONTINUE;
+                            stack_push!(PH_OBJ_FIELD_OR_END);
+                            let d = reactor.begin_object();
+                            if d < 0 {
+                                yield_or_error!(d, PH_OBJ_FIELD_OR_END);
+                            }
+                            current_phase = PH_OBJ_FIELD_OR_END;
+                            continue 'dispatch;
+                        }
+                        if ch == b'[' as i32 {
+                            top_frame!().phase = PH_OBJ_CONTINUE;
+                            stack_push!(PH_ARR_ELEM_OR_END);
+                            let d = reactor.begin_array();
+                            if d < 0 {
+                                yield_or_error!(d, PH_ARR_ELEM_OR_END);
+                            }
+                            current_phase = PH_ARR_ELEM_OR_END;
+                            continue 'dispatch;
+                        }
+                        if ch == b'n' as i32 {
+                            match_keyword!(match_null, 4, PH_OBJ_FIELD_VALUE);
+                            let d = reactor.scalar_null();
+                            if d < 0 {
+                                yield_or_error!(d, PH_OBJ_CONTINUE);
+                            }
+                            continue 'obj_loop;
+                        }
+                        if ch == b't' as i32 {
+                            match_keyword!(match_true, 4, PH_OBJ_FIELD_VALUE);
+                            let d = reactor.scalar_bool(true);
+                            if d < 0 {
+                                yield_or_error!(d, PH_OBJ_CONTINUE);
+                            }
+                            continue 'obj_loop;
+                        }
+                        if ch == b'f' as i32 {
+                            match_keyword!(match_false, 5, PH_OBJ_FIELD_VALUE);
+                            let d = reactor.scalar_bool(false);
+                            if d < 0 {
+                                yield_or_error!(d, PH_OBJ_CONTINUE);
+                            }
+                            continue 'obj_loop;
+                        }
+                        if ch == EOF {
+                            suspend_next!(PH_OBJ_FIELD_VALUE);
+                        }
+                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+                    }
+                    if ch == b'}' as i32 {
+                        cur_pos = cur_pos.add(1);
+                        stack_pop!();
+                        let d = reactor.end_object();
+                        if d < 0 {
+                            yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
+                        }
+                        current_phase = (*frames.add(depth as usize - 1)).phase;
+                        continue 'dispatch;
+                    }
+                    if ch == EOF {
+                        suspend_here!(PH_OBJ_CONTINUE);
+                    }
+                    error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+                }
+            }};
+        }
+
+        macro_rules! phase_arr_elem_or_end {
+            () => {{
+                let ch = next_structural!();
+                if ch == b']' as i32 {
+                    cur_pos = cur_pos.add(1);
+                    stack_pop!();
+                    let d = reactor.end_array();
+                    if d < 0 {
+                        yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
+                    }
+                    current_phase = (*frames.add(depth as usize - 1)).phase;
+                    continue 'dispatch;
+                }
+                if ch == EOF {
+                    suspend_next!(PH_ARR_ELEM_OR_END);
+                }
+                let d = reactor.array_elem();
+                if d != PROCEED {
+                    if d == SKIP {
+                        top_frame!().phase = PH_ARR_CONTINUE;
+                        // skip_consumed_value: cur_pos on first byte already
+                        // Inline skip_dispatch for the consumed case
+                        let ch2 = *cur_pos as i32;
+                        if ch2 == b'"' as i32 {
+                            let qp = cur_pos;
+                            let sr =
+                                string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
+                            bits = sr.bits;
+                            chunk_ptr = sr.chunk_ptr;
+                            bs_bits = sr.backslash;
+                            if sr.status != SpanStatus::Ok {
+                                suspend_at!(PH_SKIP_VALUE, qp);
+                            }
+                            cur_pos = sr.end.add(1);
+                            current_phase = PH_ARR_CONTINUE;
+                            continue 'dispatch;
+                        }
+                        if ch2 != b'{' as i32 && ch2 != b'[' as i32 {
+                            cur_pos = cur_pos.add(1);
+                            current_phase = PH_ARR_CONTINUE;
+                            continue 'dispatch;
+                        }
+                        top_frame!().data = 1;
+                        current_phase = PH_SKIP_VALUE;
+                        continue 'dispatch;
+                    }
+                    error_exit!(d, cur_offset!());
+                }
+                if ch == b'"' as i32 {
+                    let vb = cur_pos;
+                    let ss = cur_pos.add(1);
+                    parse_string_span!(end, he, PH_ARR_ELEM_OR_END, vb);
+                    let si = StrInfo {
+                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
+                        has_escape: he,
+                    };
+                    cur_pos = end.add(1);
+                    let d = reactor.scalar_string(si);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
+                    let ns = cur_pos;
+                    parse_number_span!(end, PH_ARR_ELEM_OR_END, ns);
+                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
+                    cur_pos = end;
+                    let d = reactor.scalar_number(raw);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'{' as i32 {
+                    top_frame!().phase = PH_ARR_CONTINUE;
+                    stack_push!(PH_OBJ_FIELD_OR_END);
+                    let d = reactor.begin_object();
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
+                    }
+                    current_phase = PH_OBJ_FIELD_OR_END;
+                    continue 'dispatch;
+                }
+                if ch == b'[' as i32 {
+                    top_frame!().phase = PH_ARR_CONTINUE;
+                    stack_push!(PH_ARR_ELEM_OR_END);
+                    let d = reactor.begin_array();
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
+                    }
+                    current_phase = PH_ARR_ELEM_OR_END;
+                    continue 'dispatch;
+                }
+                if ch == b'n' as i32 {
+                    match_keyword!(match_null, 4, PH_ARR_ELEM_OR_END);
+                    let d = reactor.scalar_null();
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b't' as i32 {
+                    match_keyword!(match_true, 4, PH_ARR_ELEM_OR_END);
+                    let d = reactor.scalar_bool(true);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'f' as i32 {
+                    match_keyword!(match_false, 5, PH_ARR_ELEM_OR_END);
+                    let d = reactor.scalar_bool(false);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+            }};
+        }
+
+        macro_rules! phase_arr_elem_value {
+            () => {{
+                let d = reactor.array_elem();
+                if d != PROCEED {
+                    if d == SKIP {
+                        top_frame!().phase = PH_ARR_CONTINUE;
+                        top_frame!().data = 0;
+                        current_phase = PH_SKIP_VALUE;
+                        continue 'dispatch;
+                    }
+                    error_exit!(d, cur_offset!());
+                }
+                let ch = next_structural!();
+                if ch == b'"' as i32 {
+                    let vb = cur_pos;
+                    let ss = cur_pos.add(1);
+                    parse_string_span!(end, he, PH_ARR_ELEM_VALUE, vb);
+                    let si = StrInfo {
+                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
+                        has_escape: he,
+                    };
+                    cur_pos = end.add(1);
+                    let d = reactor.scalar_string(si);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
+                    let ns = cur_pos;
+                    parse_number_span!(end, PH_ARR_ELEM_VALUE, ns);
+                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
+                    cur_pos = end;
+                    let d = reactor.scalar_number(raw);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'{' as i32 {
+                    top_frame!().phase = PH_ARR_CONTINUE;
+                    stack_push!(PH_OBJ_FIELD_OR_END);
+                    let d = reactor.begin_object();
+                    if d < 0 {
+                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
+                    }
+                    current_phase = PH_OBJ_FIELD_OR_END;
+                    continue 'dispatch;
+                }
+                if ch == b'[' as i32 {
+                    top_frame!().phase = PH_ARR_CONTINUE;
+                    stack_push!(PH_ARR_ELEM_OR_END);
+                    let d = reactor.begin_array();
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
+                    }
+                    current_phase = PH_ARR_ELEM_OR_END;
+                    continue 'dispatch;
+                }
+                if ch == b'n' as i32 {
+                    match_keyword!(match_null, 4, PH_ARR_ELEM_VALUE);
+                    let d = reactor.scalar_null();
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b't' as i32 {
+                    match_keyword!(match_true, 4, PH_ARR_ELEM_VALUE);
+                    let d = reactor.scalar_bool(true);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == b'f' as i32 {
+                    match_keyword!(match_false, 5, PH_ARR_ELEM_VALUE);
+                    let d = reactor.scalar_bool(false);
+                    if d < 0 {
+                        yield_or_error!(d, PH_ARR_CONTINUE);
+                    }
+                    current_phase = PH_ARR_CONTINUE;
+                    continue 'dispatch;
+                }
+                if ch == EOF {
+                    suspend_next!(PH_ARR_ELEM_VALUE);
+                }
+                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+            }};
+        }
+
+        macro_rules! phase_arr_continue {
+            () => {{
+                'arr_loop: loop {
+                    let ch = next_structural!();
+                    if ch == b',' as i32 {
+                        let d = reactor.array_elem();
+                        if d != PROCEED {
+                            if d == SKIP {
+                                top_frame!().phase = PH_ARR_CONTINUE;
+                                top_frame!().data = 0;
+                                current_phase = PH_SKIP_VALUE;
+                                continue 'dispatch;
+                            }
+                            error_exit!(d, cur_offset!());
+                        }
+                        let ch = next_structural!();
+                        if ch == b'"' as i32 {
+                            let vb = cur_pos;
+                            let ss = cur_pos.add(1);
+                            parse_string_span!(end, he, PH_ARR_ELEM_VALUE, vb);
+                            let si = StrInfo {
+                                raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
+                                has_escape: he,
+                            };
+                            cur_pos = end.add(1);
+                            let d = reactor.scalar_string(si);
+                            if d < 0 {
+                                yield_or_error!(d, PH_ARR_CONTINUE);
+                            }
+                            continue 'arr_loop;
+                        }
+                        if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
+                            let ns = cur_pos;
+                            parse_number_span!(end, PH_ARR_ELEM_VALUE, ns);
+                            let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
+                            cur_pos = end;
+                            let d = reactor.scalar_number(raw);
+                            if d < 0 {
+                                yield_or_error!(d, PH_ARR_CONTINUE);
+                            }
+                            continue 'arr_loop;
+                        }
+                        if ch == b'{' as i32 {
+                            top_frame!().phase = PH_ARR_CONTINUE;
+                            stack_push!(PH_OBJ_FIELD_OR_END);
+                            let d = reactor.begin_object();
+                            if d < 0 {
+                                yield_or_error!(d, PH_OBJ_FIELD_OR_END);
+                            }
+                            current_phase = PH_OBJ_FIELD_OR_END;
+                            continue 'dispatch;
+                        }
+                        if ch == b'[' as i32 {
+                            top_frame!().phase = PH_ARR_CONTINUE;
+                            stack_push!(PH_ARR_ELEM_OR_END);
+                            let d = reactor.begin_array();
+                            if d < 0 {
+                                yield_or_error!(d, PH_ARR_ELEM_OR_END);
+                            }
+                            current_phase = PH_ARR_ELEM_OR_END;
+                            continue 'dispatch;
+                        }
+                        if ch == b'n' as i32 {
+                            match_keyword!(match_null, 4, PH_ARR_ELEM_VALUE);
+                            let d = reactor.scalar_null();
+                            if d < 0 {
+                                yield_or_error!(d, PH_ARR_CONTINUE);
+                            }
+                            continue 'arr_loop;
+                        }
+                        if ch == b't' as i32 {
+                            match_keyword!(match_true, 4, PH_ARR_ELEM_VALUE);
+                            let d = reactor.scalar_bool(true);
+                            if d < 0 {
+                                yield_or_error!(d, PH_ARR_CONTINUE);
+                            }
+                            continue 'arr_loop;
+                        }
+                        if ch == b'f' as i32 {
+                            match_keyword!(match_false, 5, PH_ARR_ELEM_VALUE);
+                            let d = reactor.scalar_bool(false);
+                            if d < 0 {
+                                yield_or_error!(d, PH_ARR_CONTINUE);
+                            }
+                            continue 'arr_loop;
+                        }
+                        if ch == EOF {
+                            suspend_next!(PH_ARR_ELEM_VALUE);
+                        }
+                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+                    }
+                    if ch == b']' as i32 {
+                        cur_pos = cur_pos.add(1);
+                        stack_pop!();
+                        let d = reactor.end_array();
+                        if d < 0 {
+                            yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
+                        }
+                        current_phase = (*frames.add(depth as usize - 1)).phase;
+                        continue 'dispatch;
+                    }
+                    if ch == EOF {
+                        suspend_here!(PH_ARR_CONTINUE);
+                    }
+                    error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
+                }
+            }};
+        }
+
+        macro_rules! phase_root_done {
+            () => {{
+                let ch = next_structural_skip!();
+                if ch == EOF {
+                    stack_pop!();
+                    save_and_return!(ExitCode::Ok as i32);
+                }
+                error_exit!(ExitCode::ErrTrailing as i32, cur_offset!());
+            }};
+        }
+
+        macro_rules! phase_skip_value {
+            () => {{
+                let resume_phase = top_frame!().phase;
+                if top_frame!().data > 0 {
+                    // Resuming inside a container skip.
+                    let mut skip_depth = top_frame!().data;
+                    loop {
+                        let ch = next_structural_skip!();
+                        if ch == b'{' as i32 || ch == b'[' as i32 {
+                            skip_depth += 1;
+                        } else if ch == b'}' as i32 || ch == b']' as i32 {
+                            skip_depth -= 1;
+                            if skip_depth == 0 {
+                                cur_pos = cur_pos.add(1);
+                                current_phase = resume_phase;
+                                continue 'dispatch;
+                            }
+                        } else if ch == EOF {
+                            top_frame!().data = skip_depth;
+                            suspend_next!(PH_SKIP_VALUE);
+                        }
+                    }
+                }
+                // Fresh skip: get first structural.
+                let ch = next_structural!();
+                if ch == EOF {
+                    if (scan_state).is_final {
+                        error_exit!(ExitCode::ErrEof as i32, cur_offset!());
+                    }
+                    suspend_next!(PH_SKIP_VALUE);
+                }
+                let ch = *cur_pos as i32;
+                if ch == b'"' as i32 {
+                    let qp = cur_pos;
+                    let sr = string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
+                    bits = sr.bits;
+                    chunk_ptr = sr.chunk_ptr;
+                    bs_bits = sr.backslash;
+                    if sr.status != SpanStatus::Ok {
+                        suspend_at!(PH_SKIP_VALUE, qp);
+                    }
+                    cur_pos = sr.end.add(1);
+                    current_phase = resume_phase;
+                    continue 'dispatch;
+                }
+                if ch != b'{' as i32 && ch != b'[' as i32 {
+                    cur_pos = cur_pos.add(1);
+                    current_phase = resume_phase;
+                    continue 'dispatch;
+                }
+                let mut skip_depth: u32 = 1;
+                loop {
+                    let ch = next_structural_skip!();
+                    if ch == b'{' as i32 || ch == b'[' as i32 {
+                        skip_depth += 1;
+                    } else if ch == b'}' as i32 || ch == b']' as i32 {
+                        skip_depth -= 1;
+                        if skip_depth == 0 {
+                            cur_pos = cur_pos.add(1);
+                            current_phase = resume_phase;
+                            continue 'dispatch;
+                        }
+                    } else if ch == EOF {
+                        top_frame!().data = skip_depth;
+                        suspend_next!(PH_SKIP_VALUE);
+                    }
+                }
+            }};
+        }
+
         #[cfg(target_arch = "aarch64")]
-        unsafe {
+        {
             core::arch::asm!(
                 "adr {base}, 1000f",
                 "ldrsw {off}, [{base}, {phase:w}, sxtw #2]",
@@ -327,1549 +1088,84 @@ pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
                 base = out(reg) _,
                 off = out(reg) _,
                 phase = in(reg) current_phase as u64,
-                L0 = label { unsafe {
-                let ch = next_structural!();
-                if ch == b'{' as i32 {
-                    top_frame!().phase = PH_ROOT_DONE;
-                    stack_push!(PH_OBJ_FIELD_OR_END);
-                    let d = reactor.begin_object();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                    }
-                    current_phase = PH_OBJ_FIELD_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'[' as i32 {
-                    top_frame!().phase = PH_ROOT_DONE;
-                    stack_push!(PH_ARR_ELEM_OR_END);
-                    let d = reactor.begin_array();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                    }
-                    current_phase = PH_ARR_ELEM_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    if (scan_state).is_final {
-                        error_exit!(
-                            ExitCode::ErrEof as i32,
-                            (buf_end as usize - buf as usize) as u32
-                        );
-                    }
-                    suspend_next!(PH_ROOT_VALUE);
-                }
-                // Root scalar (rare) — inlined, no sentinel phase.
-                let ch = *cur_pos as i32;
-                if ch == b'"' as i32 {
-                    let str_start = cur_pos.add(1);
-                    let sr = string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
-                    bits = sr.bits;
-                    chunk_ptr = sr.chunk_ptr;
-                    bs_bits = sr.backslash;
-                    if sr.status != SpanStatus::Ok {
-                        if sr.status == SpanStatus::Truncated {
-                            suspend_here!(PH_ROOT_VALUE);
-                        }
-                        error_exit!(ExitCode::ErrEof as i32, cur_offset!());
-                    }
-                    let si = StrInfo {
-                        raw: RawStr::new(str_start, (sr.end as usize - str_start as usize) as u32),
-                        has_escape: sr.has_escape,
-                    };
-                    cur_pos = sr.end.add(1);
-                    let d = reactor.scalar_string(si);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                if ch == b'n' as i32 {
-                    match_keyword!(match_null, 4, PH_ROOT_VALUE);
-                    let d = reactor.scalar_null();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                if ch == b't' as i32 {
-                    match_keyword!(match_true, 4, PH_ROOT_VALUE);
-                    let d = reactor.scalar_bool(true);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                if ch == b'f' as i32 {
-                    match_keyword!(match_false, 5, PH_ROOT_VALUE);
-                    let d = reactor.scalar_bool(false);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                    let num_start = cur_pos;
-                    parse_number_span!(end, PH_ROOT_VALUE, num_start);
-                    let raw = RawStr::new(num_start, (end as usize - num_start as usize) as u32);
-                    cur_pos = end;
-                    let d = reactor.scalar_number(raw);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }},
-                L1 = label { unsafe {
-                let ch = next_structural!();
-                if ch == b'"' as i32 {
-                    let quote_pos = cur_pos;
-                    let key_start = cur_pos.add(1);
-                    parse_string_span!(end, has_esc, PH_OBJ_FIELD_OR_END, quote_pos);
-                    let colon = next_structural!();
-                    if colon != b':' as i32 {
-                        if colon == EOF {
-                            suspend_at!(PH_OBJ_FIELD_OR_END, quote_pos);
-                        }
-                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                    }
-                    let key = StrInfo {
-                        raw: RawStr::new(key_start, (end as usize - key_start as usize) as u32),
-                        has_escape: has_esc,
-                    };
-                    let d = reactor.object_field(key);
-                    if d != PROCEED {
-                        if d == SKIP {
-                            top_frame!().phase = PH_OBJ_CONTINUE;
-                            top_frame!().data = 0;
-                            current_phase = PH_SKIP_VALUE;
-                            continue 'dispatch;
-                        }
-                        yield_or_error!(d, PH_OBJ_FIELD_VALUE);
-                    }
-                    current_phase = PH_OBJ_FIELD_VALUE;
-                    continue 'dispatch;
-                }
-                if ch == b'}' as i32 {
-                    cur_pos = cur_pos.add(1);
-                    stack_pop!();
-                    let d = reactor.end_object();
-                    if d < 0 {
-                        yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
-                    }
-                    current_phase = (*frames.add(depth as usize - 1)).phase;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    suspend_next!(PH_OBJ_FIELD_OR_END);
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }},
-                L2 = label { unsafe {
-                let ch = next_structural!();
-                if ch == b'"' as i32 {
-                    let vb = cur_pos;
-                    let ss = cur_pos.add(1);
-                    parse_string_span!(end, he, PH_OBJ_FIELD_VALUE, vb);
-                    let si = StrInfo {
-                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
-                        has_escape: he,
-                    };
-                    cur_pos = end.add(1);
-                    let d = reactor.scalar_string(si);
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                    let ns = cur_pos;
-                    parse_number_span!(end, PH_OBJ_FIELD_VALUE, ns);
-                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
-                    cur_pos = end;
-                    let d = reactor.scalar_number(raw);
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'{' as i32 {
-                    top_frame!().phase = PH_OBJ_CONTINUE;
-                    stack_push!(PH_OBJ_FIELD_OR_END);
-                    let d = reactor.begin_object();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                    }
-                    current_phase = PH_OBJ_FIELD_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'[' as i32 {
-                    top_frame!().phase = PH_OBJ_CONTINUE;
-                    stack_push!(PH_ARR_ELEM_OR_END);
-                    let d = reactor.begin_array();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                    }
-                    current_phase = PH_ARR_ELEM_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'n' as i32 {
-                    match_keyword!(match_null, 4, PH_OBJ_FIELD_VALUE);
-                    let d = reactor.scalar_null();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b't' as i32 {
-                    match_keyword!(match_true, 4, PH_OBJ_FIELD_VALUE);
-                    let d = reactor.scalar_bool(true);
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'f' as i32 {
-                    match_keyword!(match_false, 5, PH_OBJ_FIELD_VALUE);
-                    let d = reactor.scalar_bool(false);
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    suspend_next!(PH_OBJ_FIELD_VALUE);
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }},
-                L3 = label { unsafe {
-                'obj_loop: loop {
-                    let ch = next_structural!();
-                    if ch == b',' as i32 {
-                        let comma_pos = cur_pos;
-                        let nch = next_structural!();
-                        if nch == EOF {
-                            suspend_at!(PH_OBJ_CONTINUE, comma_pos);
-                        }
-                        if nch != b'"' as i32 {
-                            error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                        }
-                        let key_start = cur_pos.add(1);
-                        parse_string_span!(end, has_esc, PH_OBJ_CONTINUE, comma_pos);
-                        let colon = next_structural!();
-                        if colon != b':' as i32 {
-                            if colon == EOF {
-                                suspend_at!(PH_OBJ_CONTINUE, comma_pos);
-                            }
-                            error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                        }
-                        let key = StrInfo {
-                            raw: RawStr::new(key_start, (end as usize - key_start as usize) as u32),
-                            has_escape: has_esc,
-                        };
-                        let d = reactor.object_field(key);
-                        if d != PROCEED {
-                            if d == SKIP {
-                                top_frame!().phase = PH_OBJ_CONTINUE;
-                                top_frame!().data = 0;
-                                current_phase = PH_SKIP_VALUE;
-                                continue 'dispatch;
-                            }
-                            yield_or_error!(d, PH_OBJ_FIELD_VALUE);
-                        }
-                        // Inline the value parsing (Phase 2) directly here
-                        let ch = next_structural!();
-                        if ch == b'"' as i32 {
-                            let vb = cur_pos;
-                            let ss = cur_pos.add(1);
-                            parse_string_span!(vend, he, PH_OBJ_FIELD_VALUE, vb);
-                            let si = StrInfo {
-                                raw: RawStr::new(ss, (vend as usize - ss as usize) as u32),
-                                has_escape: he,
-                            };
-                            cur_pos = vend.add(1);
-                            let d = reactor.scalar_string(si);
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop; // Stay in Phase 3 tight loop
-                        }
-                        if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                            let ns = cur_pos;
-                            parse_number_span!(vend, PH_OBJ_FIELD_VALUE, ns);
-                            let raw = RawStr::new(ns, (vend as usize - ns as usize) as u32);
-                            cur_pos = vend;
-                            let d = reactor.scalar_number(raw);
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop; // Stay in Phase 3 tight loop
-                        }
-                        // Non-scalar value: dispatch normally
-                        if ch == b'{' as i32 {
-                            top_frame!().phase = PH_OBJ_CONTINUE;
-                            stack_push!(PH_OBJ_FIELD_OR_END);
-                            let d = reactor.begin_object();
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                            }
-                            current_phase = PH_OBJ_FIELD_OR_END;
-                            continue 'dispatch;
-                        }
-                        if ch == b'[' as i32 {
-                            top_frame!().phase = PH_OBJ_CONTINUE;
-                            stack_push!(PH_ARR_ELEM_OR_END);
-                            let d = reactor.begin_array();
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                            }
-                            current_phase = PH_ARR_ELEM_OR_END;
-                            continue 'dispatch;
-                        }
-                        if ch == b'n' as i32 {
-                            match_keyword!(match_null, 4, PH_OBJ_FIELD_VALUE);
-                            let d = reactor.scalar_null();
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop;
-                        }
-                        if ch == b't' as i32 {
-                            match_keyword!(match_true, 4, PH_OBJ_FIELD_VALUE);
-                            let d = reactor.scalar_bool(true);
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop;
-                        }
-                        if ch == b'f' as i32 {
-                            match_keyword!(match_false, 5, PH_OBJ_FIELD_VALUE);
-                            let d = reactor.scalar_bool(false);
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop;
-                        }
-                        if ch == EOF {
-                            suspend_next!(PH_OBJ_FIELD_VALUE);
-                        }
-                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                    }
-                    if ch == b'}' as i32 {
-                        cur_pos = cur_pos.add(1);
-                        stack_pop!();
-                        let d = reactor.end_object();
-                        if d < 0 {
-                            yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
-                        }
-                        current_phase = (*frames.add(depth as usize - 1)).phase;
-                        continue 'dispatch;
-                    }
-                    if ch == EOF {
-                        suspend_here!(PH_OBJ_CONTINUE);
-                    }
-                    error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }
-                }},
-                L4 = label { unsafe {
-                let ch = next_structural!();
-                if ch == b']' as i32 {
-                    cur_pos = cur_pos.add(1);
-                    stack_pop!();
-                    let d = reactor.end_array();
-                    if d < 0 {
-                        yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
-                    }
-                    current_phase = (*frames.add(depth as usize - 1)).phase;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    suspend_next!(PH_ARR_ELEM_OR_END);
-                }
-                let d = reactor.array_elem();
-                if d != PROCEED {
-                    if d == SKIP {
-                        top_frame!().phase = PH_ARR_CONTINUE;
-                        // skip_consumed_value: cur_pos on first byte already
-                        // Inline skip_dispatch for the consumed case
-                        let ch2 = *cur_pos as i32;
-                        if ch2 == b'"' as i32 {
-                            let qp = cur_pos;
-                            let sr =
-                                string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
-                            bits = sr.bits;
-                            chunk_ptr = sr.chunk_ptr;
-                            bs_bits = sr.backslash;
-                            if sr.status != SpanStatus::Ok {
-                                suspend_at!(PH_SKIP_VALUE, qp);
-                            }
-                            cur_pos = sr.end.add(1);
-                            current_phase = PH_ARR_CONTINUE;
-                            continue 'dispatch;
-                        }
-                        if ch2 != b'{' as i32 && ch2 != b'[' as i32 {
-                            cur_pos = cur_pos.add(1);
-                            current_phase = PH_ARR_CONTINUE;
-                            continue 'dispatch;
-                        }
-                        top_frame!().data = 1;
-                        // Enter skip_container via PH_SKIP_VALUE
-                        current_phase = PH_SKIP_VALUE;
-                        continue 'dispatch;
-                    }
-                    error_exit!(d, cur_offset!());
-                }
-                if ch == b'"' as i32 {
-                    let vb = cur_pos;
-                    let ss = cur_pos.add(1);
-                    parse_string_span!(end, he, PH_ARR_ELEM_OR_END, vb);
-                    let si = StrInfo {
-                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
-                        has_escape: he,
-                    };
-                    cur_pos = end.add(1);
-                    let d = reactor.scalar_string(si);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                    let ns = cur_pos;
-                    parse_number_span!(end, PH_ARR_ELEM_OR_END, ns);
-                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
-                    cur_pos = end;
-                    let d = reactor.scalar_number(raw);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'{' as i32 {
-                    top_frame!().phase = PH_ARR_CONTINUE;
-                    stack_push!(PH_OBJ_FIELD_OR_END);
-                    let d = reactor.begin_object();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                    }
-                    current_phase = PH_OBJ_FIELD_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'[' as i32 {
-                    top_frame!().phase = PH_ARR_CONTINUE;
-                    stack_push!(PH_ARR_ELEM_OR_END);
-                    let d = reactor.begin_array();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                    }
-                    current_phase = PH_ARR_ELEM_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'n' as i32 {
-                    match_keyword!(match_null, 4, PH_ARR_ELEM_OR_END);
-                    let d = reactor.scalar_null();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b't' as i32 {
-                    match_keyword!(match_true, 4, PH_ARR_ELEM_OR_END);
-                    let d = reactor.scalar_bool(true);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'f' as i32 {
-                    match_keyword!(match_false, 5, PH_ARR_ELEM_OR_END);
-                    let d = reactor.scalar_bool(false);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }},
-                L5 = label { unsafe {
-                let d = reactor.array_elem();
-                if d != PROCEED {
-                    if d == SKIP {
-                        top_frame!().phase = PH_ARR_CONTINUE;
-                        top_frame!().data = 0;
-                        current_phase = PH_SKIP_VALUE;
-                        continue 'dispatch;
-                    }
-                    error_exit!(d, cur_offset!());
-                }
-                let ch = next_structural!();
-                if ch == b'"' as i32 {
-                    let vb = cur_pos;
-                    let ss = cur_pos.add(1);
-                    parse_string_span!(end, he, PH_ARR_ELEM_VALUE, vb);
-                    let si = StrInfo {
-                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
-                        has_escape: he,
-                    };
-                    cur_pos = end.add(1);
-                    let d = reactor.scalar_string(si);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                    let ns = cur_pos;
-                    parse_number_span!(end, PH_ARR_ELEM_VALUE, ns);
-                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
-                    cur_pos = end;
-                    let d = reactor.scalar_number(raw);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'{' as i32 {
-                    top_frame!().phase = PH_ARR_CONTINUE;
-                    stack_push!(PH_OBJ_FIELD_OR_END);
-                    let d = reactor.begin_object();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                    }
-                    current_phase = PH_OBJ_FIELD_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'[' as i32 {
-                    top_frame!().phase = PH_ARR_CONTINUE;
-                    stack_push!(PH_ARR_ELEM_OR_END);
-                    let d = reactor.begin_array();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                    }
-                    current_phase = PH_ARR_ELEM_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'n' as i32 {
-                    match_keyword!(match_null, 4, PH_ARR_ELEM_VALUE);
-                    let d = reactor.scalar_null();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b't' as i32 {
-                    match_keyword!(match_true, 4, PH_ARR_ELEM_VALUE);
-                    let d = reactor.scalar_bool(true);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'f' as i32 {
-                    match_keyword!(match_false, 5, PH_ARR_ELEM_VALUE);
-                    let d = reactor.scalar_bool(false);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    suspend_next!(PH_ARR_ELEM_VALUE);
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }},
-                L6 = label { unsafe {
-                'arr_loop: loop {
-                    let ch = next_structural!();
-                    if ch == b',' as i32 {
-                        // Inline Phase 5 (ARRAY_ELEM_VALUE)
-                        let d = reactor.array_elem();
-                        if d != PROCEED {
-                            if d == SKIP {
-                                top_frame!().phase = PH_ARR_CONTINUE;
-                                top_frame!().data = 0;
-                                current_phase = PH_SKIP_VALUE;
-                                continue 'dispatch;
-                            }
-                            error_exit!(d, cur_offset!());
-                        }
-                        let ch = next_structural!();
-                        if ch == b'"' as i32 {
-                            let vb = cur_pos;
-                            let ss = cur_pos.add(1);
-                            parse_string_span!(end, he, PH_ARR_ELEM_VALUE, vb);
-                            let si = StrInfo {
-                                raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
-                                has_escape: he,
-                            };
-                            cur_pos = end.add(1);
-                            let d = reactor.scalar_string(si);
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                            let ns = cur_pos;
-                            parse_number_span!(end, PH_ARR_ELEM_VALUE, ns);
-                            let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
-                            cur_pos = end;
-                            let d = reactor.scalar_number(raw);
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        // Non-scalar: dispatch
-                        if ch == b'{' as i32 {
-                            top_frame!().phase = PH_ARR_CONTINUE;
-                            stack_push!(PH_OBJ_FIELD_OR_END);
-                            let d = reactor.begin_object();
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                            }
-                            current_phase = PH_OBJ_FIELD_OR_END;
-                            continue 'dispatch;
-                        }
-                        if ch == b'[' as i32 {
-                            top_frame!().phase = PH_ARR_CONTINUE;
-                            stack_push!(PH_ARR_ELEM_OR_END);
-                            let d = reactor.begin_array();
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                            }
-                            current_phase = PH_ARR_ELEM_OR_END;
-                            continue 'dispatch;
-                        }
-                        if ch == b'n' as i32 {
-                            match_keyword!(match_null, 4, PH_ARR_ELEM_VALUE);
-                            let d = reactor.scalar_null();
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        if ch == b't' as i32 {
-                            match_keyword!(match_true, 4, PH_ARR_ELEM_VALUE);
-                            let d = reactor.scalar_bool(true);
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        if ch == b'f' as i32 {
-                            match_keyword!(match_false, 5, PH_ARR_ELEM_VALUE);
-                            let d = reactor.scalar_bool(false);
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        if ch == EOF {
-                            suspend_next!(PH_ARR_ELEM_VALUE);
-                        }
-                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                    }
-                    if ch == b']' as i32 {
-                        cur_pos = cur_pos.add(1);
-                        stack_pop!();
-                        let d = reactor.end_array();
-                        if d < 0 {
-                            yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
-                        }
-                        current_phase = (*frames.add(depth as usize - 1)).phase;
-                        continue 'dispatch;
-                    }
-                    if ch == EOF {
-                        suspend_here!(PH_ARR_CONTINUE);
-                    }
-                    error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }
-                }},
-                L7 = label { unsafe {
-                let ch = next_structural_skip!();
-                if ch == EOF {
-                    stack_pop!();
-                    save_and_return!(ExitCode::Ok as i32);
-                }
-                error_exit!(ExitCode::ErrTrailing as i32, cur_offset!());
-                }},
-                L8 = label { unsafe {
-                let resume_phase = top_frame!().phase;
-                if top_frame!().data > 0 {
-                    // Resuming inside a container skip.
-                    let mut skip_depth = top_frame!().data;
-                    loop {
-                        let ch = next_structural_skip!();
-                        if ch == b'{' as i32 || ch == b'[' as i32 {
-                            skip_depth += 1;
-                        } else if ch == b'}' as i32 || ch == b']' as i32 {
-                            skip_depth -= 1;
-                            if skip_depth == 0 {
-                                cur_pos = cur_pos.add(1);
-                                current_phase = resume_phase;
-                                continue 'dispatch;
-                            }
-                        } else if ch == EOF {
-                            top_frame!().data = skip_depth;
-                            suspend_next!(PH_SKIP_VALUE);
-                        }
-                    }
-                }
-                // Fresh skip: get first structural.
-                let ch = next_structural!();
-                if ch == EOF {
-                    if (scan_state).is_final {
-                        error_exit!(ExitCode::ErrEof as i32, cur_offset!());
-                    }
-                    suspend_next!(PH_SKIP_VALUE);
-                }
-                // skip_dispatch
-                let ch = *cur_pos as i32;
-                if ch == b'"' as i32 {
-                    let qp = cur_pos;
-                    let sr = string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
-                    bits = sr.bits;
-                    chunk_ptr = sr.chunk_ptr;
-                    bs_bits = sr.backslash;
-                    if sr.status != SpanStatus::Ok {
-                        suspend_at!(PH_SKIP_VALUE, qp);
-                    }
-                    cur_pos = sr.end.add(1);
-                    current_phase = resume_phase;
-                    continue 'dispatch;
-                }
-                if ch != b'{' as i32 && ch != b'[' as i32 {
-                    cur_pos = cur_pos.add(1);
-                    current_phase = resume_phase;
-                    continue 'dispatch;
-                }
-                // Container: enter skip loop.
-                let mut skip_depth: u32 = 1;
-                loop {
-                    let ch = next_structural_skip!();
-                    if ch == b'{' as i32 || ch == b'[' as i32 {
-                        skip_depth += 1;
-                    } else if ch == b'}' as i32 || ch == b']' as i32 {
-                        skip_depth -= 1;
-                        if skip_depth == 0 {
-                            cur_pos = cur_pos.add(1);
-                            current_phase = resume_phase;
-                            continue 'dispatch;
-                        }
-                    } else if ch == EOF {
-                        top_frame!().data = skip_depth;
-                        suspend_next!(PH_SKIP_VALUE);
-                    }
-                }
-                }},
+                L0 = label { unsafe { phase_root_value!() }},
+                L1 = label { unsafe { phase_obj_field_or_end!() }},
+                L2 = label { unsafe { phase_obj_field_value!() }},
+                L3 = label { unsafe { phase_obj_continue!() }},
+                L4 = label { unsafe { phase_arr_elem_or_end!() }},
+                L5 = label { unsafe { phase_arr_elem_value!() }},
+                L6 = label { unsafe { phase_arr_continue!() }},
+                L7 = label { unsafe { phase_root_done!() }},
+                L8 = label { unsafe { phase_skip_value!() }}
             );
             core::hint::unreachable_unchecked();
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
-        match current_phase {
-            // 0: ROOT_VALUE
-            0 => {
-                let ch = next_structural!();
-                if ch == b'{' as i32 {
-                    top_frame!().phase = PH_ROOT_DONE;
-                    stack_push!(PH_OBJ_FIELD_OR_END);
-                    let d = reactor.begin_object();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                    }
-                    current_phase = PH_OBJ_FIELD_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'[' as i32 {
-                    top_frame!().phase = PH_ROOT_DONE;
-                    stack_push!(PH_ARR_ELEM_OR_END);
-                    let d = reactor.begin_array();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                    }
-                    current_phase = PH_ARR_ELEM_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    if (scan_state).is_final {
-                        error_exit!(
-                            ExitCode::ErrEof as i32,
-                            (buf_end as usize - buf as usize) as u32
-                        );
-                    }
-                    suspend_next!(PH_ROOT_VALUE);
-                }
-                // Root scalar (rare) — inlined, no sentinel phase.
-                let ch = *cur_pos as i32;
-                if ch == b'"' as i32 {
-                    let str_start = cur_pos.add(1);
-                    let sr = string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
-                    bits = sr.bits;
-                    chunk_ptr = sr.chunk_ptr;
-                    bs_bits = sr.backslash;
-                    if sr.status != SpanStatus::Ok {
-                        if sr.status == SpanStatus::Truncated {
-                            suspend_here!(PH_ROOT_VALUE);
-                        }
-                        error_exit!(ExitCode::ErrEof as i32, cur_offset!());
-                    }
-                    let si = StrInfo {
-                        raw: RawStr::new(str_start, (sr.end as usize - str_start as usize) as u32),
-                        has_escape: sr.has_escape,
-                    };
-                    cur_pos = sr.end.add(1);
-                    let d = reactor.scalar_string(si);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                if ch == b'n' as i32 {
-                    match_keyword!(match_null, 4, PH_ROOT_VALUE);
-                    let d = reactor.scalar_null();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                if ch == b't' as i32 {
-                    match_keyword!(match_true, 4, PH_ROOT_VALUE);
-                    let d = reactor.scalar_bool(true);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                if ch == b'f' as i32 {
-                    match_keyword!(match_false, 5, PH_ROOT_VALUE);
-                    let d = reactor.scalar_bool(false);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                    let num_start = cur_pos;
-                    parse_number_span!(end, PH_ROOT_VALUE, num_start);
-                    let raw = RawStr::new(num_start, (end as usize - num_start as usize) as u32);
-                    cur_pos = end;
-                    let d = reactor.scalar_number(raw);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ROOT_DONE);
-                    }
-                    current_phase = PH_ROOT_DONE;
-                    continue 'dispatch;
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-            }
-
-            // 1: OBJECT_FIELD_OR_END
-            1 => {
-                let ch = next_structural!();
-                if ch == b'"' as i32 {
-                    let quote_pos = cur_pos;
-                    let key_start = cur_pos.add(1);
-                    parse_string_span!(end, has_esc, PH_OBJ_FIELD_OR_END, quote_pos);
-                    let colon = next_structural!();
-                    if colon != b':' as i32 {
-                        if colon == EOF {
-                            suspend_at!(PH_OBJ_FIELD_OR_END, quote_pos);
-                        }
-                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                    }
-                    let key = StrInfo {
-                        raw: RawStr::new(key_start, (end as usize - key_start as usize) as u32),
-                        has_escape: has_esc,
-                    };
-                    let d = reactor.object_field(key);
-                    if d != PROCEED {
-                        if d == SKIP {
-                            top_frame!().phase = PH_OBJ_CONTINUE;
-                            top_frame!().data = 0;
-                            current_phase = PH_SKIP_VALUE;
-                            continue 'dispatch;
-                        }
-                        yield_or_error!(d, PH_OBJ_FIELD_VALUE);
-                    }
-                    current_phase = PH_OBJ_FIELD_VALUE;
-                    continue 'dispatch;
-                }
-                if ch == b'}' as i32 {
-                    cur_pos = cur_pos.add(1);
-                    stack_pop!();
-                    let d = reactor.end_object();
-                    if d < 0 {
-                        yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
-                    }
-                    current_phase = (*frames.add(depth as usize - 1)).phase;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    suspend_next!(PH_OBJ_FIELD_OR_END);
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-            }
-
-            // 2: OBJECT_FIELD_VALUE
-            2 => {
-                let ch = next_structural!();
-                if ch == b'"' as i32 {
-                    let vb = cur_pos;
-                    let ss = cur_pos.add(1);
-                    parse_string_span!(end, he, PH_OBJ_FIELD_VALUE, vb);
-                    let si = StrInfo {
-                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
-                        has_escape: he,
-                    };
-                    cur_pos = end.add(1);
-                    let d = reactor.scalar_string(si);
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                    let ns = cur_pos;
-                    parse_number_span!(end, PH_OBJ_FIELD_VALUE, ns);
-                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
-                    cur_pos = end;
-                    let d = reactor.scalar_number(raw);
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'{' as i32 {
-                    top_frame!().phase = PH_OBJ_CONTINUE;
-                    stack_push!(PH_OBJ_FIELD_OR_END);
-                    let d = reactor.begin_object();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                    }
-                    current_phase = PH_OBJ_FIELD_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'[' as i32 {
-                    top_frame!().phase = PH_OBJ_CONTINUE;
-                    stack_push!(PH_ARR_ELEM_OR_END);
-                    let d = reactor.begin_array();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                    }
-                    current_phase = PH_ARR_ELEM_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'n' as i32 {
-                    match_keyword!(match_null, 4, PH_OBJ_FIELD_VALUE);
-                    let d = reactor.scalar_null();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b't' as i32 {
-                    match_keyword!(match_true, 4, PH_OBJ_FIELD_VALUE);
-                    let d = reactor.scalar_bool(true);
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'f' as i32 {
-                    match_keyword!(match_false, 5, PH_OBJ_FIELD_VALUE);
-                    let d = reactor.scalar_bool(false);
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_CONTINUE);
-                    }
-                    current_phase = PH_OBJ_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    suspend_next!(PH_OBJ_FIELD_VALUE);
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-            }
-
-            // 3: OBJECT_CONTINUE_OR_END
-            // Fused tight loop: comma → key → colon → value → repeat
-            // Avoids re-dispatching to Phase 2 for scalar values.
-            3 => {
-                'obj_loop: loop {
-                    let ch = next_structural!();
-                    if ch == b',' as i32 {
-                        let comma_pos = cur_pos;
-                        let nch = next_structural!();
-                        if nch == EOF {
-                            suspend_at!(PH_OBJ_CONTINUE, comma_pos);
-                        }
-                        if nch != b'"' as i32 {
-                            error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                        }
-                        let key_start = cur_pos.add(1);
-                        parse_string_span!(end, has_esc, PH_OBJ_CONTINUE, comma_pos);
-                        let colon = next_structural!();
-                        if colon != b':' as i32 {
-                            if colon == EOF {
-                                suspend_at!(PH_OBJ_CONTINUE, comma_pos);
-                            }
-                            error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                        }
-                        let key = StrInfo {
-                            raw: RawStr::new(key_start, (end as usize - key_start as usize) as u32),
-                            has_escape: has_esc,
-                        };
-                        let d = reactor.object_field(key);
-                        if d != PROCEED {
-                            if d == SKIP {
-                                top_frame!().phase = PH_OBJ_CONTINUE;
-                                top_frame!().data = 0;
-                                current_phase = PH_SKIP_VALUE;
-                                continue 'dispatch;
-                            }
-                            yield_or_error!(d, PH_OBJ_FIELD_VALUE);
-                        }
-                        // Inline the value parsing (Phase 2) directly here
-                        let ch = next_structural!();
-                        if ch == b'"' as i32 {
-                            let vb = cur_pos;
-                            let ss = cur_pos.add(1);
-                            parse_string_span!(vend, he, PH_OBJ_FIELD_VALUE, vb);
-                            let si = StrInfo {
-                                raw: RawStr::new(ss, (vend as usize - ss as usize) as u32),
-                                has_escape: he,
-                            };
-                            cur_pos = vend.add(1);
-                            let d = reactor.scalar_string(si);
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop; // Stay in Phase 3 tight loop
-                        }
-                        if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                            let ns = cur_pos;
-                            parse_number_span!(vend, PH_OBJ_FIELD_VALUE, ns);
-                            let raw = RawStr::new(ns, (vend as usize - ns as usize) as u32);
-                            cur_pos = vend;
-                            let d = reactor.scalar_number(raw);
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop; // Stay in Phase 3 tight loop
-                        }
-                        // Non-scalar value: dispatch normally
-                        if ch == b'{' as i32 {
-                            top_frame!().phase = PH_OBJ_CONTINUE;
-                            stack_push!(PH_OBJ_FIELD_OR_END);
-                            let d = reactor.begin_object();
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                            }
-                            current_phase = PH_OBJ_FIELD_OR_END;
-                            continue 'dispatch;
-                        }
-                        if ch == b'[' as i32 {
-                            top_frame!().phase = PH_OBJ_CONTINUE;
-                            stack_push!(PH_ARR_ELEM_OR_END);
-                            let d = reactor.begin_array();
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                            }
-                            current_phase = PH_ARR_ELEM_OR_END;
-                            continue 'dispatch;
-                        }
-                        if ch == b'n' as i32 {
-                            match_keyword!(match_null, 4, PH_OBJ_FIELD_VALUE);
-                            let d = reactor.scalar_null();
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop;
-                        }
-                        if ch == b't' as i32 {
-                            match_keyword!(match_true, 4, PH_OBJ_FIELD_VALUE);
-                            let d = reactor.scalar_bool(true);
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop;
-                        }
-                        if ch == b'f' as i32 {
-                            match_keyword!(match_false, 5, PH_OBJ_FIELD_VALUE);
-                            let d = reactor.scalar_bool(false);
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_CONTINUE);
-                            }
-                            continue 'obj_loop;
-                        }
-                        if ch == EOF {
-                            suspend_next!(PH_OBJ_FIELD_VALUE);
-                        }
-                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                    }
-                    if ch == b'}' as i32 {
-                        cur_pos = cur_pos.add(1);
-                        stack_pop!();
-                        let d = reactor.end_object();
-                        if d < 0 {
-                            yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
-                        }
-                        current_phase = (*frames.add(depth as usize - 1)).phase;
-                        continue 'dispatch;
-                    }
-                    if ch == EOF {
-                        suspend_here!(PH_OBJ_CONTINUE);
-                    }
-                    error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }
-            }
-
-            // 4: ARRAY_ELEM_OR_END
-            4 => {
-                let ch = next_structural!();
-                if ch == b']' as i32 {
-                    cur_pos = cur_pos.add(1);
-                    stack_pop!();
-                    let d = reactor.end_array();
-                    if d < 0 {
-                        yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
-                    }
-                    current_phase = (*frames.add(depth as usize - 1)).phase;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    suspend_next!(PH_ARR_ELEM_OR_END);
-                }
-                let d = reactor.array_elem();
-                if d != PROCEED {
-                    if d == SKIP {
-                        top_frame!().phase = PH_ARR_CONTINUE;
-                        // skip_consumed_value: cur_pos on first byte already
-                        // Inline skip_dispatch for the consumed case
-                        let ch2 = *cur_pos as i32;
-                        if ch2 == b'"' as i32 {
-                            let qp = cur_pos;
-                            let sr =
-                                string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
-                            bits = sr.bits;
-                            chunk_ptr = sr.chunk_ptr;
-                            bs_bits = sr.backslash;
-                            if sr.status != SpanStatus::Ok {
-                                suspend_at!(PH_SKIP_VALUE, qp);
-                            }
-                            cur_pos = sr.end.add(1);
-                            current_phase = PH_ARR_CONTINUE;
-                            continue 'dispatch;
-                        }
-                        if ch2 != b'{' as i32 && ch2 != b'[' as i32 {
-                            cur_pos = cur_pos.add(1);
-                            current_phase = PH_ARR_CONTINUE;
-                            continue 'dispatch;
-                        }
-                        top_frame!().data = 1;
-                        // Enter skip_container via PH_SKIP_VALUE
-                        current_phase = PH_SKIP_VALUE;
-                        continue 'dispatch;
-                    }
-                    error_exit!(d, cur_offset!());
-                }
-                if ch == b'"' as i32 {
-                    let vb = cur_pos;
-                    let ss = cur_pos.add(1);
-                    parse_string_span!(end, he, PH_ARR_ELEM_OR_END, vb);
-                    let si = StrInfo {
-                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
-                        has_escape: he,
-                    };
-                    cur_pos = end.add(1);
-                    let d = reactor.scalar_string(si);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                    let ns = cur_pos;
-                    parse_number_span!(end, PH_ARR_ELEM_OR_END, ns);
-                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
-                    cur_pos = end;
-                    let d = reactor.scalar_number(raw);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'{' as i32 {
-                    top_frame!().phase = PH_ARR_CONTINUE;
-                    stack_push!(PH_OBJ_FIELD_OR_END);
-                    let d = reactor.begin_object();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                    }
-                    current_phase = PH_OBJ_FIELD_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'[' as i32 {
-                    top_frame!().phase = PH_ARR_CONTINUE;
-                    stack_push!(PH_ARR_ELEM_OR_END);
-                    let d = reactor.begin_array();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                    }
-                    current_phase = PH_ARR_ELEM_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'n' as i32 {
-                    match_keyword!(match_null, 4, PH_ARR_ELEM_OR_END);
-                    let d = reactor.scalar_null();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b't' as i32 {
-                    match_keyword!(match_true, 4, PH_ARR_ELEM_OR_END);
-                    let d = reactor.scalar_bool(true);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'f' as i32 {
-                    match_keyword!(match_false, 5, PH_ARR_ELEM_OR_END);
-                    let d = reactor.scalar_bool(false);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-            }
-
-            // 5: ARRAY_ELEM_VALUE
-            5 => {
-                let d = reactor.array_elem();
-                if d != PROCEED {
-                    if d == SKIP {
-                        top_frame!().phase = PH_ARR_CONTINUE;
-                        top_frame!().data = 0;
-                        current_phase = PH_SKIP_VALUE;
-                        continue 'dispatch;
-                    }
-                    error_exit!(d, cur_offset!());
-                }
-                let ch = next_structural!();
-                if ch == b'"' as i32 {
-                    let vb = cur_pos;
-                    let ss = cur_pos.add(1);
-                    parse_string_span!(end, he, PH_ARR_ELEM_VALUE, vb);
-                    let si = StrInfo {
-                        raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
-                        has_escape: he,
-                    };
-                    cur_pos = end.add(1);
-                    let d = reactor.scalar_string(si);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                    let ns = cur_pos;
-                    parse_number_span!(end, PH_ARR_ELEM_VALUE, ns);
-                    let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
-                    cur_pos = end;
-                    let d = reactor.scalar_number(raw);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'{' as i32 {
-                    top_frame!().phase = PH_ARR_CONTINUE;
-                    stack_push!(PH_OBJ_FIELD_OR_END);
-                    let d = reactor.begin_object();
-                    if d < 0 {
-                        yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                    }
-                    current_phase = PH_OBJ_FIELD_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'[' as i32 {
-                    top_frame!().phase = PH_ARR_CONTINUE;
-                    stack_push!(PH_ARR_ELEM_OR_END);
-                    let d = reactor.begin_array();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                    }
-                    current_phase = PH_ARR_ELEM_OR_END;
-                    continue 'dispatch;
-                }
-                if ch == b'n' as i32 {
-                    match_keyword!(match_null, 4, PH_ARR_ELEM_VALUE);
-                    let d = reactor.scalar_null();
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b't' as i32 {
-                    match_keyword!(match_true, 4, PH_ARR_ELEM_VALUE);
-                    let d = reactor.scalar_bool(true);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == b'f' as i32 {
-                    match_keyword!(match_false, 5, PH_ARR_ELEM_VALUE);
-                    let d = reactor.scalar_bool(false);
-                    if d < 0 {
-                        yield_or_error!(d, PH_ARR_CONTINUE);
-                    }
-                    current_phase = PH_ARR_CONTINUE;
-                    continue 'dispatch;
-                }
-                if ch == EOF {
-                    suspend_next!(PH_ARR_ELEM_VALUE);
-                }
-                error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-            }
-
-            // 6: ARRAY_CONTINUE_OR_END
-            // Fused tight loop: comma → array_elem → value → repeat
-            6 => {
-                'arr_loop: loop {
-                    let ch = next_structural!();
-                    if ch == b',' as i32 {
-                        // Inline Phase 5 (ARRAY_ELEM_VALUE)
-                        let d = reactor.array_elem();
-                        if d != PROCEED {
-                            if d == SKIP {
-                                top_frame!().phase = PH_ARR_CONTINUE;
-                                top_frame!().data = 0;
-                                current_phase = PH_SKIP_VALUE;
-                                continue 'dispatch;
-                            }
-                            error_exit!(d, cur_offset!());
-                        }
-                        let ch = next_structural!();
-                        if ch == b'"' as i32 {
-                            let vb = cur_pos;
-                            let ss = cur_pos.add(1);
-                            parse_string_span!(end, he, PH_ARR_ELEM_VALUE, vb);
-                            let si = StrInfo {
-                                raw: RawStr::new(ss, (end as usize - ss as usize) as u32),
-                                has_escape: he,
-                            };
-                            cur_pos = end.add(1);
-                            let d = reactor.scalar_string(si);
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        if ch == b'-' as i32 || (ch >= b'0' as i32 && ch <= b'9' as i32) {
-                            let ns = cur_pos;
-                            parse_number_span!(end, PH_ARR_ELEM_VALUE, ns);
-                            let raw = RawStr::new(ns, (end as usize - ns as usize) as u32);
-                            cur_pos = end;
-                            let d = reactor.scalar_number(raw);
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        // Non-scalar: dispatch
-                        if ch == b'{' as i32 {
-                            top_frame!().phase = PH_ARR_CONTINUE;
-                            stack_push!(PH_OBJ_FIELD_OR_END);
-                            let d = reactor.begin_object();
-                            if d < 0 {
-                                yield_or_error!(d, PH_OBJ_FIELD_OR_END);
-                            }
-                            current_phase = PH_OBJ_FIELD_OR_END;
-                            continue 'dispatch;
-                        }
-                        if ch == b'[' as i32 {
-                            top_frame!().phase = PH_ARR_CONTINUE;
-                            stack_push!(PH_ARR_ELEM_OR_END);
-                            let d = reactor.begin_array();
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_ELEM_OR_END);
-                            }
-                            current_phase = PH_ARR_ELEM_OR_END;
-                            continue 'dispatch;
-                        }
-                        if ch == b'n' as i32 {
-                            match_keyword!(match_null, 4, PH_ARR_ELEM_VALUE);
-                            let d = reactor.scalar_null();
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        if ch == b't' as i32 {
-                            match_keyword!(match_true, 4, PH_ARR_ELEM_VALUE);
-                            let d = reactor.scalar_bool(true);
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        if ch == b'f' as i32 {
-                            match_keyword!(match_false, 5, PH_ARR_ELEM_VALUE);
-                            let d = reactor.scalar_bool(false);
-                            if d < 0 {
-                                yield_or_error!(d, PH_ARR_CONTINUE);
-                            }
-                            continue 'arr_loop;
-                        }
-                        if ch == EOF {
-                            suspend_next!(PH_ARR_ELEM_VALUE);
-                        }
-                        error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                    }
-                    if ch == b']' as i32 {
-                        cur_pos = cur_pos.add(1);
-                        stack_pop!();
-                        let d = reactor.end_array();
-                        if d < 0 {
-                            yield_or_error!(d, (*frames.add(depth as usize - 1)).phase);
-                        }
-                        current_phase = (*frames.add(depth as usize - 1)).phase;
-                        continue 'dispatch;
-                    }
-                    if ch == EOF {
-                        suspend_here!(PH_ARR_CONTINUE);
-                    }
-                    error_exit!(ExitCode::ErrSyntax as i32, cur_offset!());
-                }
-            }
-
-            // 7: ROOT_DONE
-            7 => {
-                let ch = next_structural_skip!();
-                if ch == EOF {
-                    stack_pop!();
-                    save_and_return!(ExitCode::Ok as i32);
-                }
-                error_exit!(ExitCode::ErrTrailing as i32, cur_offset!());
-            }
-
-            // 8: SKIP_VALUE — self-contained skip logic
-            8 => {
-                let resume_phase = top_frame!().phase;
-                if top_frame!().data > 0 {
-                    // Resuming inside a container skip.
-                    let mut skip_depth = top_frame!().data;
-                    loop {
-                        let ch = next_structural_skip!();
-                        if ch == b'{' as i32 || ch == b'[' as i32 {
-                            skip_depth += 1;
-                        } else if ch == b'}' as i32 || ch == b']' as i32 {
-                            skip_depth -= 1;
-                            if skip_depth == 0 {
-                                cur_pos = cur_pos.add(1);
-                                current_phase = resume_phase;
-                                continue 'dispatch;
-                            }
-                        } else if ch == EOF {
-                            top_frame!().data = skip_depth;
-                            suspend_next!(PH_SKIP_VALUE);
-                        }
-                    }
-                }
-                // Fresh skip: get first structural.
-                let ch = next_structural!();
-                if ch == EOF {
-                    if (scan_state).is_final {
-                        error_exit!(ExitCode::ErrEof as i32, cur_offset!());
-                    }
-                    suspend_next!(PH_SKIP_VALUE);
-                }
-                // skip_dispatch
-                let ch = *cur_pos as i32;
-                if ch == b'"' as i32 {
-                    let qp = cur_pos;
-                    let sr = string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
-                    bits = sr.bits;
-                    chunk_ptr = sr.chunk_ptr;
-                    bs_bits = sr.backslash;
-                    if sr.status != SpanStatus::Ok {
-                        suspend_at!(PH_SKIP_VALUE, qp);
-                    }
-                    cur_pos = sr.end.add(1);
-                    current_phase = resume_phase;
-                    continue 'dispatch;
-                }
-                if ch != b'{' as i32 && ch != b'[' as i32 {
-                    cur_pos = cur_pos.add(1);
-                    current_phase = resume_phase;
-                    continue 'dispatch;
-                }
-                // Container: enter skip loop.
-                let mut skip_depth: u32 = 1;
-                loop {
-                    let ch = next_structural_skip!();
-                    if ch == b'{' as i32 || ch == b'[' as i32 {
-                        skip_depth += 1;
-                    } else if ch == b'}' as i32 || ch == b']' as i32 {
-                        skip_depth -= 1;
-                        if skip_depth == 0 {
-                            cur_pos = cur_pos.add(1);
-                            current_phase = resume_phase;
-                            continue 'dispatch;
-                        }
-                    } else if ch == EOF {
-                        top_frame!().data = skip_depth;
-                        suspend_next!(PH_SKIP_VALUE);
-                    }
-                }
-            }
-
-            // SAFETY: phase is always 0..=8 by construction.
-            _ => {
-                core::hint::unreachable_unchecked();
-            }
+        #[cfg(target_arch = "x86_64")]
+        {
+            core::arch::asm!(
+                "lea {base}, [rip + 2000f]",
+                "movsxd {off}, dword ptr [{base} + {phase} * 4]",
+                "add {base}, {off}",
+                "jmp {base}",
+                ".p2align 2",
+                "2000:",
+                ".long {L0} - 2000b",
+                ".long {L1} - 2000b",
+                ".long {L2} - 2000b",
+                ".long {L3} - 2000b",
+                ".long {L4} - 2000b",
+                ".long {L5} - 2000b",
+                ".long {L6} - 2000b",
+                ".long {L7} - 2000b",
+                ".long {L8} - 2000b",
+                base = out(reg) _,
+                off = out(reg) _,
+                phase = in(reg) current_phase as u64,
+                L0 = label { unsafe { phase_root_value!() }},
+                L1 = label { unsafe { phase_obj_field_or_end!() }},
+                L2 = label { unsafe { phase_obj_field_value!() }},
+                L3 = label { unsafe { phase_obj_continue!() }},
+                L4 = label { unsafe { phase_arr_elem_or_end!() }},
+                L5 = label { unsafe { phase_arr_elem_value!() }},
+                L6 = label { unsafe { phase_arr_continue!() }},
+                L7 = label { unsafe { phase_root_done!() }},
+                L8 = label { unsafe { phase_skip_value!() }}
+            );
+            core::hint::unreachable_unchecked();
         }
-    }
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        match current_phase {
+            0 => {
+                phase_root_value!()
+            }
+            1 => {
+                phase_obj_field_or_end!()
+            }
+            2 => {
+                phase_obj_field_value!()
+            }
+            3 => {
+                phase_obj_continue!()
+            }
+            4 => {
+                phase_arr_elem_or_end!()
+            }
+            5 => {
+                phase_arr_elem_value!()
+            }
+            6 => {
+                phase_arr_continue!()
+            }
+            7 => {
+                phase_root_done!()
+            }
+            8 => {
+                phase_skip_value!()
+            }
+            // SAFETY: phase is always 0..=8 by construction.
+            _ => core::hint::unreachable_unchecked(),
+        }
+    } // 'dispatch loop
 }

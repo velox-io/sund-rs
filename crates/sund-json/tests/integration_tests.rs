@@ -1,21 +1,17 @@
-//! Integration tests for the sund-core parser kernel.
+//! Integration tests for the sund-json parser.
 
-use sund_core::kernel;
-use sund_core::reactor::{NullReactor, Reactor};
-use sund_core::types::*;
+use sund_json::parser;
+use sund_json::reactor::{NullReactor, Reactor};
+use sund_json::types::*;
 
 /// Helper: parse a complete JSON input with the given reactor.
 /// Returns the exit_code.
 fn parse_all<R: Reactor>(json: &[u8], reactor: &mut R) -> i32 {
     let mut ctx = Ctx::new();
     ctx.set_input_slice(json, true);
-    unsafe { kernel::parse(&mut ctx, reactor) };
+    unsafe { parser::parse(&mut ctx, reactor) };
     ctx.exit_code
 }
-
-// ---------------------------------------------------------------------------
-// Validate-only (NullReactor)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_empty_object() {
@@ -106,10 +102,6 @@ fn test_root_false() {
     assert_eq!(parse_all(b"false", &mut NullReactor), ExitCode::Ok as i32);
 }
 
-// ---------------------------------------------------------------------------
-// Error cases
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_trailing_content() {
     let json = b"{}{}";
@@ -133,10 +125,6 @@ fn test_syntax_error() {
         ExitCode::ErrSyntax as i32
     );
 }
-
-// ---------------------------------------------------------------------------
-// Event-collecting reactor
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq)]
 enum Event {
@@ -247,10 +235,6 @@ fn test_array_event_collection() {
         ]
     );
 }
-
-// ---------------------------------------------------------------------------
-// SKIP directive
-// ---------------------------------------------------------------------------
 
 struct SkipFieldReactor {
     skip_field: String,

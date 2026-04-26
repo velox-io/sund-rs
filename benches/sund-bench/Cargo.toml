@@ -5,8 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-sund-core = { path = "../../crates/sund-core" }
-sund-bind = { path = "../../crates/sund-bind" }
+sund-json = { path = "../../crates/sund-json" }
 
 [[bin]]
 name = "sund_bench"

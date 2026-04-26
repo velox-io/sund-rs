@@ -1,6 +1,6 @@
 //! AVX2 implementation of chunk classification for x86_64.
 //!
-//! Port of the C `ndec_classify_chunk` using shuffle-LUT approach.
+//! Uses a shuffle-LUT approach for byte classification.
 //! Also provides `prefix_xor_x86` via PCLMULQDQ (carry-less multiply).
 
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -9,10 +9,6 @@ use super::ChunkClass;
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
-
-// ---------------------------------------------------------------------------
-// prefix_xor via PCLMULQDQ (carry-less multiply)
-// ---------------------------------------------------------------------------
 
 /// Compute prefix-XOR using `_mm_clmulepi64_si128` (PCLMULQDQ).
 ///
@@ -31,10 +27,6 @@ pub(crate) unsafe fn prefix_xor_x86(v: u64) -> u64 {
     _mm_cvtsi128_si64(r) as u64
 }
 
-// ---------------------------------------------------------------------------
-// classify_chunk: 64 bytes → ChunkClass
-// ---------------------------------------------------------------------------
-
 /// Classify 64 input bytes using AVX2 shuffle-LUT approach.
 ///
 /// # Safety
@@ -47,24 +39,24 @@ pub(crate) unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
     let v0 = _mm256_loadu_si256(buf as *const __m256i);
     let v1 = _mm256_loadu_si256(buf.add(32) as *const __m256i);
 
-    // --- Backslash (0x5C) ---
+    // Backslash (0x5C)
     let bs_cmp = _mm256_set1_epi8(0x5Cu8 as i8);
     let bs0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, bs_cmp)) as u32;
     let bs1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, bs_cmp)) as u32;
     let backslash = (bs0 as u64) | ((bs1 as u64) << 32);
 
-    // --- Quote (0x22) ---
+    // Quote (0x22)
     let qt_cmp = _mm256_set1_epi8(0x22u8 as i8);
     let qt0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, qt_cmp)) as u32;
     let qt1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, qt_cmp)) as u32;
     let raw_quote = (qt0 as u64) | ((qt1 as u64) << 32);
 
-    // --- Low nibbles (shared for whitespace and operator LUTs) ---
+    // Low nibbles (shared for whitespace and operator LUTs)
     let low_mask = _mm256_set1_epi8(0x0F);
     let lo0 = _mm256_and_si256(v0, low_mask);
     let lo1 = _mm256_and_si256(v1, low_mask);
 
-    // --- Whitespace ---
+    // Whitespace
     // ws_lut: maps low nibble → the whitespace char with that nibble.
     // Compare the shuffled result with the original byte; match only if
     // both nibble and high byte agree (no false positives for non-ws).
@@ -76,7 +68,7 @@ pub(crate) unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
     let ws1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_shuffle_epi8(ws_lut, lo1), v1)) as u32;
     let whitespace = (ws0 as u64) | ((ws1 as u64) << 32);
 
-    // --- Operators: ',', ':', '[', ']', '{', '}' ---
+    // Operators: ',', ':', '[', ']', '{', '}'
     // Three LUTs, each mapping low nibble → the target char. OR the three
     // match masks to cover all six operators.
     //   op_lut1: ',' (0x2C) at index 12, ':' (0x3A) at index 10

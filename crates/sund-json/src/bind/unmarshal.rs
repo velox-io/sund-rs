@@ -1,26 +1,16 @@
 //! Schema-driven JSON unmarshal: reactor hooks + entry points.
-//!
-//! Ported from `ndec/impl/bind.c` §2-§5.
 
-use crate::arena::Arena;
-use crate::type_info::{Field, Kind, TypeInfo};
-use sund_core::kernel;
-use sund_core::reactor::Reactor;
-use sund_core::types::*;
-
-// ---------------------------------------------------------------------------
-// Error codes
-// ---------------------------------------------------------------------------
+use super::arena::Arena;
+use super::type_info::{Field, Kind, TypeInfo};
+use crate::parser;
+use crate::reactor::Reactor;
+use crate::types::*;
 
 /// Bind-specific error codes (start at 32 to avoid collision with kernel codes).
 pub const ERR_BIND_TYPE_MISMATCH: i32 = 32;
 pub const ERR_BIND_NUMBER_RANGE: i32 = 33;
 pub const ERR_BIND_UNKNOWN_FIELD: i32 = 34;
 pub const ERR_BIND_OOM: i32 = 35;
-
-// ---------------------------------------------------------------------------
-// Options / Error
-// ---------------------------------------------------------------------------
 
 /// Options for `unmarshal_ex`.
 #[derive(Clone, Debug, Default)]
@@ -39,10 +29,6 @@ pub struct UnmarshalError {
     /// Human-readable message (static; do not free).
     pub message: &'static str,
 }
-
-// ---------------------------------------------------------------------------
-// Internal bind state
-// ---------------------------------------------------------------------------
 
 /// Frame kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,7 +156,6 @@ impl BindState {
                     top.cap = new_cap;
                 }
                 let offset = top.count * elem_size;
-                // Zero-init the new element.
                 for b in &mut top.scratch[offset..offset + elem_size] {
                     *b = 0;
                 }
@@ -200,12 +185,7 @@ impl BindState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Scalar writers
-// ---------------------------------------------------------------------------
-
 unsafe fn write_number(bs: &mut BindState, dst: *mut u8, kind: Kind, raw: &[u8]) -> i32 {
-    // NUL-terminate for parsing.
     let mut buf = [0u8; 64];
     if raw.len() >= buf.len() {
         return bs.fail(ERR_BIND_NUMBER_RANGE, "number too long");
@@ -296,10 +276,6 @@ unsafe fn write_number(bs: &mut BindState, dst: *mut u8, kind: Kind, raw: &[u8])
     }
     0
 }
-
-// ---------------------------------------------------------------------------
-// Reactor implementation
-// ---------------------------------------------------------------------------
 
 impl Reactor for BindState {
     fn begin_object(&mut self) -> i32 {
@@ -530,10 +506,6 @@ impl Reactor for BindState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry points
-// ---------------------------------------------------------------------------
-
 /// Unmarshal JSON data into `out` according to the schema in `type_info`.
 ///
 /// Returns `Ok(())` on success, or `Err(code)` on failure.
@@ -555,9 +527,7 @@ pub fn unmarshal_ex(
     opts: Option<&UnmarshalOpts>,
     err: Option<&mut UnmarshalError>,
 ) -> Result<(), i32> {
-    if let Some(e) = err.as_ref() {
-        let _ = e; // just checking it exists
-    }
+    if let Some(_e) = err.as_ref() {}
 
     // Bootstrap: synthetic root frame.
     let root_field = Field {
@@ -589,9 +559,9 @@ pub fn unmarshal_ex(
     let mut ctx = Ctx::new();
     ctx.set_input_slice(data, true);
 
-    unsafe { kernel::parse(&mut ctx, &mut bs) };
+    // SAFETY: ctx was initialised via Ctx::new() and input set via set_input_slice() above.
+    unsafe { parser::parse(&mut ctx, &mut bs) };
 
-    // Finalize.
     let kernel_exit = ctx.exit_code;
     let kernel_pos = ctx.error_pos;
 

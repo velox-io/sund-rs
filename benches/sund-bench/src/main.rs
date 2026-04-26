@@ -18,15 +18,11 @@ use std::fs;
 use std::hint::black_box;
 use std::time::Instant;
 
-use sund_core::kernel;
-use sund_core::reactor::{NullReactor, Reactor};
-use sund_core::types::*;
+use sund_json::parser;
+use sund_json::reactor::{NullReactor, Reactor};
+use sund_json::types::*;
 
-use sund_bind::number::parse_double;
-
-// ---------------------------------------------------------------------------
-// Payload loader
-// ---------------------------------------------------------------------------
+use sund_json::bind::number::parse_double;
 
 /// Default payload paths to try (relative to CWD or absolute).
 const DEFAULT_PATHS: &[&str] = &[
@@ -95,10 +91,6 @@ fn get_iterations(json_len: usize) -> usize {
     est.max(1000).min(50_000_000)
 }
 
-// ---------------------------------------------------------------------------
-// BASE mode — validate-only (NullReactor)
-// ---------------------------------------------------------------------------
-
 fn bench_base(json: &[u8]) {
     let json_len = json.len();
     let iterations = get_iterations(json_len);
@@ -110,7 +102,7 @@ fn bench_base(json: &[u8]) {
     for _ in 0..1000 {
         let mut ctx = Ctx::new();
         ctx.set_input_slice(json, true);
-        unsafe { kernel::parse(&mut ctx, &mut NullReactor) };
+        unsafe { parser::parse(&mut ctx, &mut NullReactor) };
         black_box(&ctx);
     }
 
@@ -119,7 +111,7 @@ fn bench_base(json: &[u8]) {
     for _ in 0..iterations {
         let mut ctx = Ctx::new();
         ctx.set_input_slice(json, true);
-        unsafe { kernel::parse(&mut ctx, &mut NullReactor) };
+        unsafe { parser::parse(&mut ctx, &mut NullReactor) };
         black_box(&ctx);
     }
     let elapsed = start.elapsed();
@@ -135,18 +127,12 @@ fn bench_base(json: &[u8]) {
     println!("  {:.1} MB/s ({:.2} GB/s)", mb_per_sec, gb_per_sec);
 }
 
-// ---------------------------------------------------------------------------
-// PARSE mode — full parse with inline callbacks (FullSink reactor)
-// ---------------------------------------------------------------------------
-
-/// Matches C `StringView`.
 #[derive(Clone, Copy)]
 struct StringView {
     ptr: *const u8,
     len: u32,
 }
 
-/// Matches C `FullSink`.
 struct FullSink {
     num_sum: f64,
     field_count: u32,
@@ -266,7 +252,7 @@ fn bench_parse(json: &[u8]) {
         sink.reset();
         let mut ctx = Ctx::new();
         ctx.set_input_slice(json, true);
-        unsafe { kernel::parse(&mut ctx, &mut sink) };
+        unsafe { parser::parse(&mut ctx, &mut sink) };
         black_box(&ctx);
         black_box(&sink.num_sum);
     }
@@ -277,7 +263,7 @@ fn bench_parse(json: &[u8]) {
         sink.reset();
         let mut ctx = Ctx::new();
         ctx.set_input_slice(json, true);
-        unsafe { kernel::parse(&mut ctx, &mut sink) };
+        unsafe { parser::parse(&mut ctx, &mut sink) };
         black_box(&ctx);
         black_box(&sink.num_sum);
     }
@@ -302,10 +288,6 @@ fn bench_parse(json: &[u8]) {
         sink.null_count
     );
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 fn main() {
     let args: Vec<String> = env::args().collect();

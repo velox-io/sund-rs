@@ -1,6 +1,4 @@
 //! Type metadata for schema-driven unmarshal.
-//!
-//! Ported from `ndec/impl/bind.h`.
 
 /// Type kinds for bind fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

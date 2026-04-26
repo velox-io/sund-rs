@@ -1,15 +1,11 @@
 //! Scalar fallback for chunk classification and prefix-XOR.
 //!
 //! Used on architectures without NEON or AVX2 SIMD support.
-//! Correct but slow — byte-by-byte classification into the 4 bitmaps.
+//! Correct but slow: byte-by-byte classification into the 4 bitmaps.
 
 #![allow(dead_code)] // Only used on non-SIMD targets.
 
 use super::ChunkClass;
-
-// ---------------------------------------------------------------------------
-// prefix_xor: shift-XOR cascade (generic fallback)
-// ---------------------------------------------------------------------------
 
 /// Compute prefix-XOR via the shift-XOR cascade.
 ///
@@ -25,10 +21,6 @@ pub(crate) fn prefix_xor_generic(mut v: u64) -> u64 {
     v ^= v << 32;
     v
 }
-
-// ---------------------------------------------------------------------------
-// classify_chunk: scalar byte-by-byte fallback
-// ---------------------------------------------------------------------------
 
 /// Classify a single byte: returns `(is_backslash, is_quote, is_whitespace, is_op)`.
 #[inline(always)]

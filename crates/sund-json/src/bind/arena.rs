@@ -1,6 +1,4 @@
 //! Bump arena allocator.
-//!
-//! Ported from `ndec/impl/bind.c` §1.
 
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 const ALIGN: usize = 16; // max_align_t equivalent on 64-bit

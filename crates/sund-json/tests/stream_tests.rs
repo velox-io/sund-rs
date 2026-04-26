@@ -1,8 +1,8 @@
-//! Integration tests for the sund-stream driver.
+//! Integration tests for the sund-json stream driver.
 
-use sund_core::reactor::{NullReactor, Reactor};
-use sund_core::types::*;
-use sund_stream::{Stream, StreamStatus};
+use sund_json::reactor::{NullReactor, Reactor};
+use sund_json::types::*;
+use sund_json::{Stream, StreamStatus};
 
 #[test]
 fn test_feed_all_object() {
@@ -22,7 +22,6 @@ fn test_feed_all_error() {
 
 #[test]
 fn test_streaming_chunks() {
-    // Feed a JSON object in two chunks.
     let chunk1 = br#"{"name":"tes"#;
     let chunk2 = br#"t","age":30}"#;
 

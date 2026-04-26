@@ -1,6 +1,4 @@
-//! Reactor trait — callback interface for JSON parsing events.
-//!
-//! Maps from the C `NdecReactor` vtable in `ndec/impl/types.h`.
+//! Reactor trait: callback interface for JSON parsing events.
 
 use crate::types::{RawStr, StrInfo, PROCEED};
 
@@ -69,10 +67,6 @@ pub trait Reactor {
         PROCEED
     }
 }
-
-// ---------------------------------------------------------------------------
-// NullReactor — validate-only (equivalent to passing NULL reactor in C)
-// ---------------------------------------------------------------------------
 
 /// A no-op reactor for validate-only parsing.
 ///

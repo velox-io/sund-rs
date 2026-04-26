@@ -1,9 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/sund-core",
-    "crates/sund-stream",
-    "crates/sund-bind",
+    "crates/sund-json",
     "crates/sund-derive",
     "sund",
     "benches/sund-bench",

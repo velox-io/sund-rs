@@ -8,12 +8,5 @@ license.workspace = true
 repository.workspace = true
 readme = "../README.md"
 
-[features]
-default = ["stream", "bind"]
-stream = ["sund-stream"]
-bind = ["sund-bind"]
-
 [dependencies]
-sund-core = { path = "../crates/sund-core" }
-sund-stream = { path = "../crates/sund-stream", optional = true }
-sund-bind = { path = "../crates/sund-bind", optional = true }
+sund-json = { path = "../crates/sund-json" }

@@ -1,16 +1,8 @@
-//! Core types mapped from C `ndec/impl/types.h`.
+//! Core types for the sund JSON parser.
 
 use std::marker::PhantomData;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 pub const MAX_DEPTH: usize = 256;
-
-// ---------------------------------------------------------------------------
-// ExitCode
-// ---------------------------------------------------------------------------
 
 /// Parser exit / error codes, matching `enum NdecExit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,10 +16,6 @@ pub enum ExitCode {
     ErrKeyword = 5,
     ErrTrailing = 6,
 }
-
-// ---------------------------------------------------------------------------
-// Phase
-// ---------------------------------------------------------------------------
 
 /// Frame phase, matching `enum NdecPhase`.
 ///
@@ -51,38 +39,26 @@ pub enum Phase {
 /// Total number of phase variants (for jump-table sizing, etc.).
 pub const PHASE_COUNT: u32 = 9;
 
-// ---------------------------------------------------------------------------
-// ScanState
-// ---------------------------------------------------------------------------
-
 /// Cross-chunk carry state for the SIMD scanner, matching `NdecScanState`.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct ScanState {
-    /// 0 or `!0` — were we inside a string at the end of the last chunk?
+    /// 0 or `!0`: were we inside a string at the end of the last chunk?
     pub prev_in_string: u64,
-    /// 0 or 1 — was the last byte of the previous chunk an active escape?
+    /// 0 or 1: was the last byte of the previous chunk an active escape?
     pub prev_escape: u64,
-    /// 0 or 1 — was the last byte structural-or-whitespace?
+    /// 0 or 1: was the last byte structural-or-whitespace?
     pub prev_structural_or_ws: u64,
     /// Has the caller signalled end-of-input?
     pub is_final: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Reactor directives
-// ---------------------------------------------------------------------------
-
 /// Continue parsing.
 pub const PROCEED: i32 = 0;
 /// Skip the upcoming value (object value or array element).
 pub const SKIP: i32 = 1;
-/// Suspend — return control to the caller.
+/// Suspend: return control to the caller.
 pub const YIELD: i32 = -1;
-
-// ---------------------------------------------------------------------------
-// RawStr / StrInfo
-// ---------------------------------------------------------------------------
 
 /// A borrowed raw byte range, matching `NdecRawStr`.
 ///
@@ -143,10 +119,6 @@ pub struct StrInfo<'a> {
     pub has_escape: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Frame
-// ---------------------------------------------------------------------------
-
 /// A single stack frame, matching `NdecFrame`.
 ///
 /// Uses raw `u32` for `phase` (not the `Phase` enum) to match C's untyped
@@ -155,14 +127,10 @@ pub struct StrInfo<'a> {
 #[repr(C)]
 pub struct Frame {
     pub phase: u32,
-    /// Scratch slot — currently used only by `SkipValue` to persist
+    /// Scratch slot, currently used only by `SkipValue` to persist
     /// `skip_depth` across suspend/resume.
     pub data: u32,
 }
-
-// ---------------------------------------------------------------------------
-// Ctx
-// ---------------------------------------------------------------------------
 
 /// Parser context, matching `NdecCtx` (minus reactor/user_data).
 ///
@@ -196,12 +164,12 @@ impl Ctx {
     /// Create a context matching C's `ndec_ctx_init`.
     ///
     /// Only zeroes the hot fields (~48 bytes); the `frames` array is left
-    /// uninitialised — the kernel writes each frame before reading it.
+    /// uninitialised; the parser writes each frame before reading it.
     #[inline]
     pub fn new() -> Self {
-        // SAFETY: We only leave `frames` uninitialised — it's a [Frame; 256]
+        // SAFETY: We only leave `frames` uninitialised. It's a [Frame; 256]
         // array of plain u32 pairs with no drop/validity invariants. The
-        // kernel always writes frames[i] via stack_push before reading it.
+        // parser always writes frames[i] via stack_push before reading it.
         // All other fields are explicitly initialised below.
         #[allow(invalid_value)]
         let mut ctx: Self = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
@@ -261,7 +229,7 @@ impl std::fmt::Debug for Ctx {
             .field("exit_code", &self.exit_code)
             .field("error_pos", &self.error_pos)
             .field("depth", &self.depth)
-            // Don't dump the full 256-entry frame array — show active frames only.
+            // Only show active frames, not the full 256-entry array.
             .field("frames[..depth]", &&self.frames[..self.depth as usize])
             .finish()
     }

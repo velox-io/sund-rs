@@ -1,6 +1,6 @@
 [package]
-name = "sund-core"
-description = "Zero-allocation, suspendable JSON parsing kernel with SIMD structural scanning and reactor-style output."
+name = "sund-json"
+description = "Suspendable JSON parser with SIMD structural scanning and reactor-style output."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,6 +12,3 @@ default = ["std"]
 std = []
 
 [dependencies]
-
-[build-dependencies]
-cc = "1"

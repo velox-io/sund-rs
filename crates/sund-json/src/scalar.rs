@@ -2,15 +2,11 @@
 //!
 //! Each helper folds the streaming `is_final` check internally and returns a
 //! small status enum, so the caller dispatches with a single match.
-//!
-//! Ported from `ndec/impl/scalar.h`.
 
-use crate::scanner::{advance_chunk, advance_chunk_outlined, clear_lowest_bit, ctz64_empty, AdvanceResult};
+use crate::scanner::{
+    advance_chunk, advance_chunk_outlined, clear_lowest_bit, ctz64_empty, AdvanceResult,
+};
 use crate::types::ScanState;
-
-// ---------------------------------------------------------------------------
-// Keyword match result
-// ---------------------------------------------------------------------------
 
 /// Result of matching a keyword (null / true / false).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,10 +19,6 @@ pub enum KwResult {
     /// Wrong content, or truncated under `is_final`.
     Bad = 2,
 }
-
-// ---------------------------------------------------------------------------
-// Span result status
-// ---------------------------------------------------------------------------
 
 /// Status returned by `string_span` / `number_span`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,10 +49,6 @@ pub struct SpanResult {
     pub backslash: u64,
 }
 
-// ---------------------------------------------------------------------------
-// 4-byte atom comparison via u32 XOR
-// ---------------------------------------------------------------------------
-
 /// Compare 4 bytes at `src` against a 4-byte atom string.
 /// Returns 0 on match. Compiler folds the constant at compile time.
 ///
@@ -72,10 +60,6 @@ unsafe fn str4_xor(src: *const u8, atom: &[u8; 4]) -> u32 {
     let av = u32::from_ne_bytes(*atom);
     sv ^ av
 }
-
-// ---------------------------------------------------------------------------
-// Keyword matchers
-// ---------------------------------------------------------------------------
 
 /// Match `null` at `cur_pos`.
 ///
@@ -137,10 +121,6 @@ pub unsafe fn match_false(cur_pos: *const u8, buf_end: *const u8, state: &ScanSt
         KwResult::Truncated
     }
 }
-
-// ---------------------------------------------------------------------------
-// string_span: find closing quote
-// ---------------------------------------------------------------------------
 
 /// Find the closing quote of a JSON string. `bits` and `bs_bits` are passed
 /// by value and returned in the result. `bs_bits` is the backslash bitmap for
@@ -206,10 +186,6 @@ pub unsafe fn string_span(
         bs_bits = new_bs;
     }
 }
-
-// ---------------------------------------------------------------------------
-// number_span: find end of number
-// ---------------------------------------------------------------------------
 
 /// Find the end of a JSON number. Does NOT consume the next structural.
 ///
