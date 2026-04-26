@@ -69,9 +69,38 @@ pub fn clear_lowest_bit(v: u64) -> u64 {
 /// `true` if `v` was zero (empty bitmap).
 ///
 /// On x86-64 with BMI1, `tzcnt` sets CF=1 exactly when the source is 0,
-/// giving one fewer instruction than `test + tzcnt`.  The Rust
-/// `trailing_zeros()` intrinsic already compiles to `tzcnt` on modern
-/// targets and returns 64 for zero input.
+/// giving one fewer instruction than `test + tzcnt`. The Rust
+/// `trailing_zeros()` intrinsic compiles to `tzcnt` on modern targets
+/// and returns 64 for zero input.
+///
+/// We tried three routes to recover the C reference's `tzcnt + jc` form
+/// (~12 ns/iter on the 1332-byte payload, theoretically):
+///
+/// 1. Stable `asm!("tzcnt; setc", ...)` returning a `bool` — opaque
+///    to LLVM, defeats CSE/DCE, static tzcnt count grew 30 → 75, base
+///    regressed 476 → 516 ns.
+/// 2. Nightly `asm_goto_with_outputs` jumping to a `return true`
+///    block — emits the right `tzcnt + jb`, but LLVM lowers the
+///    `callbr` IR pessimistically: it spills 4–5 callee-save
+///    registers into the stack frame *before each* tzcnt site to
+///    pin live-out values across the unknown branch. Static rsp
+///    movs grew ~500 → 661, base regressed 476 → 553 ns.
+/// 3. `naked_asm!`/extern "C" wrapper — eliminates LLVM optimiser
+///    pessimisation around the asm, but turns the inlined helper into
+///    an ABI call. Returning a Rust `bool` through `al` forces the
+///    caller into `call + test al,al + jne` (3 insns), which is
+///    *worse* than the current portable form's `test + je + tzcnt`
+///    (also 3 insns) because it adds a real call/ret. CF cannot be
+///    propagated across a function boundary in System V x86-64 ABI.
+///
+/// **The optimisation is structurally unreachable from Rust** until
+/// LLVM grows `"=@ccc"`-style flag outputs for `asm!` (issue
+/// rust-lang/rust#101019 family). For reference, clang has the same
+/// limitation: written in C without the GCC `__asm__("=@ccc")`
+/// extension, the equivalent code generates the identical 3-instruction
+/// `test; je; tzcnt` sequence — ndec is fast specifically because it
+/// hand-writes inline asm, not because C compilers fold the pattern
+/// automatically.
 #[inline(always)]
 pub fn ctz64_empty(v: u64, out_idx: &mut u32) -> bool {
     *out_idx = v.trailing_zeros();
