@@ -133,6 +133,13 @@ pub unsafe fn match_false(cur_pos: *const u8, buf_end: *const u8, state: &ScanSt
 ///
 /// # Safety
 /// All pointers must be valid within the same allocation.
+///
+/// No explicit `target_feature` here: this function is intended to be
+/// inlined into `parser::parse` (which carries the feature set), so
+/// putting `target_feature` here would be redundant AND would conflict
+/// with `#[inline(always)]` — the compiler forbids that combination.
+/// When inlined at a feature-carrying call site, the downstream
+/// `advance_chunk_outlined` / SIMD calls do inherit the feature set.
 #[inline(always)]
 pub unsafe fn string_span(
     mut bits: u64,
@@ -195,6 +202,9 @@ pub unsafe fn string_span(
 ///
 /// # Safety
 /// All pointers must be valid within the same allocation.
+///
+/// See the note on `string_span`: no explicit `target_feature`, we
+/// rely on being inlined into a feature-carrying caller.
 #[inline(always)]
 pub unsafe fn number_span(
     mut bits: u64,

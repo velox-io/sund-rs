@@ -31,6 +31,17 @@ const PH_SKIP_VALUE: u32 = 8;
 /// The caller must ensure `ctx` was initialised via [`Ctx::new`] and its input
 /// buffer set via [`Ctx::set_input_slice`] (or [`Ctx::set_input`] with valid
 /// pointers).
+///
+/// On x86-64 this function carries `target_feature(avx2,pclmulqdq,bmi1)` so
+/// the SIMD scanner (`classify_chunk`, `prefix_xor_x86`, etc.) can be
+/// inlined directly into the hot state-machine loop. Without the feature
+/// annotation, Rust refuses to inline across the `#[target_feature]`
+/// boundary and every 64-byte chunk pays a real `call` plus caller-save
+/// register spills — on Zen 2 that costs ~20% of end-to-end throughput.
+#[cfg_attr(
+    target_arch = "x86_64",
+    target_feature(enable = "avx2,pclmulqdq,bmi1")
+)]
 pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
     let buf = ctx.buf;
     let buf_end = ctx.buf_end;

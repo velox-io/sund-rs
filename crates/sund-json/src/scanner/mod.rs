@@ -84,8 +84,15 @@ pub fn ctz64_empty(v: u64, out_idx: &mut u32) -> bool {
 /// - aarch64: PMULL (polynomial multiply)
 /// - x86-64:  PCLMULQDQ (carry-less multiply)
 /// - fallback: shift-XOR cascade
-#[inline(always)]
-pub fn prefix_xor(v: u64) -> u64 {
+///
+/// On x86-64 this wrapper carries `target_feature(pclmulqdq)` so the
+/// three-instruction body of [`avx2::prefix_xor_x86`] can be inlined
+/// into callers that also carry the feature (e.g. `parser::parse`).
+/// Without it, Rust refuses to inline across a `target_feature`
+/// boundary and every scan chunk pays a real `call`.
+#[inline]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "sse2,pclmulqdq"))]
+pub unsafe fn prefix_xor(v: u64) -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: On aarch64 we require NEON+AES (PMULL). The caller must
@@ -111,7 +118,12 @@ pub fn prefix_xor(v: u64) -> u64 {
 /// # Safety
 ///
 /// `buf` must point to at least 64 readable bytes.
-#[inline(always)]
+///
+/// On x86-64 this wrapper carries `target_feature(avx2)` so the AVX2
+/// classifier body can be inlined into feature-carrying callers. See
+/// the note on [`prefix_xor`] above.
+#[inline]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 pub unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
     #[cfg(target_arch = "aarch64")]
     {
@@ -170,7 +182,8 @@ pub fn compute_escaped(backslash: u64, state: &mut ScanState) -> EscapeResult {
 /// # Safety
 ///
 /// `buf` must point to at least 64 readable bytes.
-#[inline(always)]
+#[inline]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,pclmulqdq"))]
 pub unsafe fn scan_chunk(buf: *const u8, state: &mut ScanState) -> ChunkResult {
     let cls = classify_chunk(buf);
 
@@ -213,7 +226,16 @@ pub unsafe fn scan_chunk(buf: *const u8, state: &mut ScanState) -> ChunkResult {
 ///
 /// * `next` must be readable for `remaining` bytes (`remaining > 0`).
 /// * `remaining` must be in `1..64`.
-#[inline(never)]
+///
+/// Was previously `#[inline(never)]` to keep the 64-byte scratch
+/// buffer out of the hot path. On x86-64 that introduced a
+/// `target_feature` call boundary — every call site required an
+/// implicit `vzeroupper` on AVX upper-dirty state which on Zen 2
+/// costs ~2–5 cycles. Relaxing to `#[inline]` lets rustc fold the tail
+/// path into `parse` where AVX context is already live; the cold
+/// branch pays the scratch cost only in payload-boundary iterations.
+#[inline]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,pclmulqdq"))]
 pub unsafe fn advance_chunk_tail(
     next: *const u8,
     remaining: isize,
@@ -248,7 +270,8 @@ pub unsafe fn advance_chunk_tail(
 /// * `chunk_ptr` and `buf_end` must be valid pointers within (or one-past)
 ///   the same allocation.
 /// * `chunk_ptr + 64 <= buf_end` when there is a full chunk available.
-#[inline(always)]
+#[inline]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,pclmulqdq"))]
 pub unsafe fn advance_chunk(
     chunk_ptr: *const u8,
     buf_end: *const u8,
@@ -284,7 +307,14 @@ pub unsafe fn advance_chunk(
 /// # Safety
 ///
 /// Same as `advance_chunk`. `bs_out` must be a valid writable pointer.
+///
+/// This one stays `#[inline(never)]` on purpose: it's the out-of-line
+/// sink for `string_span`/`number_span` chunk refill, and is reached
+/// across a real call boundary. Because callers sit in an AVX2 context
+/// (they're inlined into `parser::parse`), we still carry
+/// `target_feature` here so our own body can use SIMD directly.
 #[inline(never)]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,pclmulqdq"))]
 pub unsafe fn advance_chunk_outlined(
     chunk_ptr: *const u8,
     buf_end: *const u8,

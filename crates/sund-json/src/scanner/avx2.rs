@@ -18,8 +18,13 @@ use core::arch::x86_64::*;
 /// # Safety
 ///
 /// Requires x86-64 with SSE2 and PCLMULQDQ support.
+///
+/// Marked `#[inline]` so callers that already carry the
+/// `pclmulqdq` target_feature can inline the three-instruction body
+/// (avoids a real `call` in the hot scan path).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2,pclmulqdq")]
+#[inline]
 pub(crate) unsafe fn prefix_xor_x86(v: u64) -> u64 {
     let x = _mm_set_epi64x(0, v as i64);
     let ones = _mm_set_epi64x(0, -1i64);
@@ -33,8 +38,15 @@ pub(crate) unsafe fn prefix_xor_x86(v: u64) -> u64 {
 ///
 /// `buf` must point to at least 64 readable bytes.
 /// Requires x86-64 with AVX2 support.
+///
+/// Marked `#[inline]` so callers that already carry the `avx2`
+/// target_feature can inline the whole classifier into the scan path
+/// — otherwise `target_feature` acts as a hard internal-linkage
+/// boundary and prevents inlining even across `#[inline(always)]`
+/// callers.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline]
 pub(crate) unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
     let v0 = _mm256_loadu_si256(buf as *const __m256i);
     let v1 = _mm256_loadu_si256(buf.add(32) as *const __m256i);
