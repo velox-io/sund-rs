@@ -227,14 +227,15 @@ pub unsafe fn scan_chunk(buf: *const u8, state: &mut ScanState) -> ChunkResult {
 /// * `next` must be readable for `remaining` bytes (`remaining > 0`).
 /// * `remaining` must be in `1..64`.
 ///
-/// Was previously `#[inline(never)]` to keep the 64-byte scratch
-/// buffer out of the hot path. On x86-64 that introduced a
-/// `target_feature` call boundary — every call site required an
-/// implicit `vzeroupper` on AVX upper-dirty state which on Zen 2
-/// costs ~2–5 cycles. Relaxing to `#[inline]` lets rustc fold the tail
-/// path into `parse` where AVX context is already live; the cold
-/// branch pays the scratch cost only in payload-boundary iterations.
-#[inline]
+/// Kept `#[inline(never)]` on purpose, even though the hot path would
+/// benefit from inlining the SIMD body. If this gets inlined into
+/// `advance_chunk`, the tail branch bloats `advance_chunk` past the
+/// point where LLVM is willing to inline it into `parse`. That in
+/// turn leaves a real `call` to `advance_chunk` per chunk, costing
+/// more than keeping `_tail` external. The current tradeoff:
+/// `advance_chunk` stays small, inlines into `parse` at every chunk
+/// site, and the cold tail pays one call per payload boundary.
+#[inline(never)]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,pclmulqdq"))]
 pub unsafe fn advance_chunk_tail(
     next: *const u8,
