@@ -80,7 +80,7 @@ fn load_payload() -> (Vec<u8>, String) {
 
 fn get_iterations(json_len: usize) -> usize {
     if let Ok(s) = env::var("BENCH_ITERS") {
-        return s.parse().unwrap_or(1_000_000);
+        return s.parse().unwrap_or(50_000);
     }
     // Auto-tune: target ~2 seconds of work.
     // Rough estimate: ~5 GB/s throughput → ns_per_byte ≈ 0.2
@@ -128,9 +128,9 @@ fn bench_base(json: &[u8]) {
 }
 
 #[derive(Clone, Copy)]
-struct StringView {
-    ptr: *const u8,
-    len: u32,
+pub struct StringView {
+    pub ptr: *const u8,
+    pub len: u32,
 }
 
 struct FullSink {
