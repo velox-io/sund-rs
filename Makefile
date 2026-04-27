@@ -14,7 +14,7 @@ bench-parse: bench-release
 	@./target/release/sund_bench parse --payload=$(PAYLOAD)
 
 bench-release:
-	@cargo build --release -p sund-bench 2>&1 | tail -1
+	@RUSTFLAGS="-C target-cpu=native" cargo build --release -p sund-bench 2>&1 | tail -1
 
 # Run all payload shapes for comparison
 bench-all-payloads: bench-release
