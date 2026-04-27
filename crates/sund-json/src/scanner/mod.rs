@@ -216,20 +216,28 @@ pub fn compute_escaped(backslash: u64, state: &mut ScanState) -> EscapeResult {
 pub unsafe fn scan_chunk(buf: *const u8, state: &mut ScanState) -> ChunkResult {
     let cls = classify_chunk(buf);
 
-    // Consume cross-chunk escape carry.  When the previous chunk ended
-    // with a live backslash (prev_escape == 1), bit 0 of the current
-    // chunk's quote bitmap is an escaped character, not a real quote.
-    // We mask it out branchlessly: `prev_escape` is 0 or 1 so
-    // `!prev_escape` is ~0 or ~1, clearing only bit 0 when needed.
-    let raw_quote_adj = cls.raw_quote & !state.prev_escape;
-
     // Fast path: most chunks have no backslashes.
+    //
+    // Cross-chunk escape carry only matters on this path: when the
+    // previous chunk ended with a live backslash (prev_escape == 1),
+    // bit 0 of the current chunk's quote bitmap is an escaped character
+    // (e.g. `\"` straddling the boundary), not a real quote.  Mask it
+    // branchlessly: `prev_escape` is 0 or 1, so `!prev_escape` is ~0 or
+    // ~1 — clearing only bit 0 when needed.  LLVM folds this into a
+    // single BMI `andn`.
+    //
+    // The slow path (backslash != 0) does NOT need a separate mask:
+    // `compute_escaped` already folds `prev_escape` into the `escaped`
+    // bitmap (see the `backslash | state.prev_escape` in its final XOR),
+    // so `raw_quote & !escaped` correctly clears any escaped quote at
+    // bit 0.
     let real_quotes = if cls.backslash == 0 {
+        let adj = cls.raw_quote & !state.prev_escape;
         state.prev_escape = 0;
-        raw_quote_adj
+        adj
     } else {
         let esc = compute_escaped(cls.backslash, state);
-        raw_quote_adj & !esc.escaped
+        cls.raw_quote & !esc.escaped
     };
 
     let in_string = prefix_xor(real_quotes) ^ state.prev_in_string;
