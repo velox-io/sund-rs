@@ -47,121 +47,15 @@ pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
             (cur_pos as usize - buf as usize) as u32
         };
     }
-    macro_rules! save_and_return {
-        ($code:expr) => {{
-            ctx.cur_pos = cur_pos.add(1);
-            ctx.chunk_ptr = chunk_ptr;
-            ctx.structural_bits = bits;
-            ctx.scan_state = scan_state;
-            ctx.depth = depth;
-            ctx.exit_code = $code;
-            return;
-        }};
-    }
     macro_rules! top_frame {
         () => {
             &mut *frames.add(depth as usize - 1)
         };
     }
-    macro_rules! stack_push {
-        ($child_phase:expr) => {{
-            if depth >= MAX_DEPTH as u32 {
-                ctx.error_pos = cur_offset!();
-                ctx.cur_pos = cur_pos;
-                ctx.chunk_ptr = chunk_ptr;
-                ctx.structural_bits = bits;
-                ctx.scan_state = scan_state;
-                ctx.depth = depth;
-                ctx.exit_code = ExitCode::ErrDepth as i32;
-                return;
-            }
-            (*frames.add(depth as usize)).phase = $child_phase;
-            (*frames.add(depth as usize)).data = 0;
-            depth += 1;
-        }};
-    }
     macro_rules! stack_pop {
         () => {
             depth -= 1;
         };
-    }
-    macro_rules! error_exit {
-        ($code:expr, $pos:expr) => {{
-            ctx.error_pos = $pos;
-            ctx.cur_pos = cur_pos;
-            ctx.chunk_ptr = chunk_ptr;
-            ctx.structural_bits = bits;
-            ctx.scan_state = scan_state;
-            ctx.depth = depth;
-            ctx.exit_code = $code;
-            return;
-        }};
-    }
-    macro_rules! yield_or_error {
-        ($directive:expr, $resume_phase:expr) => {{
-            let d = $directive;
-            if d == YIELD {
-                (*frames.add(depth as usize - 1)).phase = $resume_phase;
-                if bits == 0 {
-                    let effective = if cur_pos < buf_end { cur_pos } else { buf_end };
-                    if effective > chunk_ptr {
-                        chunk_ptr = effective;
-                    }
-                }
-                ctx.cur_pos = cur_pos;
-                ctx.chunk_ptr = chunk_ptr;
-                ctx.structural_bits = bits;
-                ctx.scan_state = scan_state;
-                ctx.depth = depth;
-                ctx.exit_code = ExitCode::Suspend as i32;
-                return;
-            }
-            error_exit!(d, cur_offset!());
-        }};
-    }
-    macro_rules! suspend_next {
-        ($phase_val:expr) => {{
-            cur_pos = cur_pos.add(1);
-            if depth > 0 {
-                (*frames.add(depth as usize - 1)).phase = $phase_val;
-            }
-            ctx.cur_pos = cur_pos;
-            ctx.chunk_ptr = chunk_ptr;
-            ctx.structural_bits = bits;
-            ctx.scan_state = scan_state;
-            ctx.depth = depth;
-            ctx.exit_code = ExitCode::Suspend as i32;
-            return;
-        }};
-    }
-    macro_rules! suspend_here {
-        ($phase_val:expr) => {{
-            if depth > 0 {
-                (*frames.add(depth as usize - 1)).phase = $phase_val;
-            }
-            ctx.cur_pos = cur_pos;
-            ctx.chunk_ptr = chunk_ptr;
-            ctx.structural_bits = bits;
-            ctx.scan_state = scan_state;
-            ctx.depth = depth;
-            ctx.exit_code = ExitCode::Suspend as i32;
-            return;
-        }};
-    }
-    macro_rules! suspend_at {
-        ($phase_val:expr, $ptr:expr) => {{
-            cur_pos = $ptr;
-            if depth > 0 {
-                (*frames.add(depth as usize - 1)).phase = $phase_val;
-            }
-            ctx.cur_pos = cur_pos;
-            ctx.chunk_ptr = chunk_ptr;
-            ctx.structural_bits = bits;
-            ctx.scan_state = scan_state;
-            ctx.depth = depth;
-            ctx.exit_code = ExitCode::Suspend as i32;
-            return;
-        }};
     }
     macro_rules! next_structural {
         () => {{
@@ -204,45 +98,6 @@ pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
                 bits = ar.bits;
             }
         }};
-    }
-    macro_rules! match_keyword {
-        ($match_fn:ident, $advance_by:expr, $resume_phase:expr) => {{
-            let kw = $match_fn(cur_pos, buf_end, &scan_state);
-            if kw != KwResult::Ok {
-                if kw == KwResult::Truncated {
-                    suspend_here!($resume_phase);
-                }
-                error_exit!(ExitCode::ErrKeyword as i32, cur_offset!());
-            }
-            cur_pos = cur_pos.add($advance_by);
-        }};
-    }
-    macro_rules! parse_string_span {
-        ($out_end:ident, $out_has_escape:ident, $resume_phase:expr, $rollback_pos:expr) => {
-            let _sr = string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
-            bits = _sr.bits;
-            chunk_ptr = _sr.chunk_ptr;
-            bs_bits = _sr.backslash;
-            let $out_end = _sr.end;
-            let $out_has_escape = _sr.has_escape;
-            if _sr.status != SpanStatus::Ok {
-                if _sr.status == SpanStatus::Truncated {
-                    suspend_at!($resume_phase, $rollback_pos);
-                }
-                error_exit!(ExitCode::ErrEof as i32, cur_offset!());
-            }
-        };
-    }
-    macro_rules! parse_number_span {
-        ($out_end:ident, $resume_phase:expr, $rollback_pos:expr) => {
-            let _sr = number_span(bits, buf_end, chunk_ptr, &mut scan_state);
-            bits = _sr.bits;
-            chunk_ptr = _sr.chunk_ptr;
-            let $out_end = _sr.end;
-            if _sr.status == SpanStatus::Truncated {
-                suspend_at!($resume_phase, $rollback_pos);
-            }
-        };
     }
 
     let initial_phase: u32;
@@ -289,8 +144,122 @@ pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
     }
 
     let mut current_phase = initial_phase;
+    #[allow(unused_assignments)]
+    let mut exit_code: i32 = 0;
+    let mut error_pos: u32 = u32::MAX;
 
     'dispatch: loop {
+        macro_rules! save_and_return {
+            ($code:expr) => {{
+                cur_pos = cur_pos.add(1);
+                exit_code = $code;
+                break 'dispatch;
+            }};
+        }
+        macro_rules! stack_push {
+            ($child_phase:expr) => {{
+                if depth >= MAX_DEPTH as u32 {
+                    error_pos = cur_offset!();
+                    exit_code = ExitCode::ErrDepth as i32;
+                    break 'dispatch;
+                }
+                (*frames.add(depth as usize)).phase = $child_phase;
+                (*frames.add(depth as usize)).data = 0;
+                depth += 1;
+            }};
+        }
+        macro_rules! error_exit {
+            ($code:expr, $pos:expr) => {{
+                error_pos = $pos;
+                exit_code = $code;
+                break 'dispatch;
+            }};
+        }
+        macro_rules! yield_or_error {
+            ($directive:expr, $resume_phase:expr) => {{
+                let d = $directive;
+                if d == YIELD {
+                    (*frames.add(depth as usize - 1)).phase = $resume_phase;
+                    if bits == 0 {
+                        let effective = if cur_pos < buf_end { cur_pos } else { buf_end };
+                        if effective > chunk_ptr {
+                            chunk_ptr = effective;
+                        }
+                    }
+                    exit_code = ExitCode::Suspend as i32;
+                    break 'dispatch;
+                }
+                error_exit!(d, cur_offset!());
+            }};
+        }
+        macro_rules! suspend_next {
+            ($phase_val:expr) => {{
+                cur_pos = cur_pos.add(1);
+                if depth > 0 {
+                    (*frames.add(depth as usize - 1)).phase = $phase_val;
+                }
+                exit_code = ExitCode::Suspend as i32;
+                break 'dispatch;
+            }};
+        }
+        macro_rules! suspend_here {
+            ($phase_val:expr) => {{
+                if depth > 0 {
+                    (*frames.add(depth as usize - 1)).phase = $phase_val;
+                }
+                exit_code = ExitCode::Suspend as i32;
+                break 'dispatch;
+            }};
+        }
+        macro_rules! suspend_at {
+            ($phase_val:expr, $ptr:expr) => {{
+                cur_pos = $ptr;
+                if depth > 0 {
+                    (*frames.add(depth as usize - 1)).phase = $phase_val;
+                }
+                exit_code = ExitCode::Suspend as i32;
+                break 'dispatch;
+            }};
+        }
+        macro_rules! match_keyword {
+            ($match_fn:ident, $advance_by:expr, $resume_phase:expr) => {{
+                let kw = $match_fn(cur_pos, buf_end, &scan_state);
+                if kw != KwResult::Ok {
+                    if kw == KwResult::Truncated {
+                        suspend_here!($resume_phase);
+                    }
+                    error_exit!(ExitCode::ErrKeyword as i32, cur_offset!());
+                }
+                cur_pos = cur_pos.add($advance_by);
+            }};
+        }
+        macro_rules! parse_string_span {
+            ($out_end:ident, $out_has_escape:ident, $resume_phase:expr, $rollback_pos:expr) => {
+                let _sr = string_span(bits, bs_bits, buf_end, chunk_ptr, &mut scan_state);
+                bits = _sr.bits;
+                chunk_ptr = _sr.chunk_ptr;
+                bs_bits = _sr.backslash;
+                let $out_end = _sr.end;
+                let $out_has_escape = _sr.has_escape;
+                if _sr.status != SpanStatus::Ok {
+                    if _sr.status == SpanStatus::Truncated {
+                        suspend_at!($resume_phase, $rollback_pos);
+                    }
+                    error_exit!(ExitCode::ErrEof as i32, cur_offset!());
+                }
+            };
+        }
+        macro_rules! parse_number_span {
+            ($out_end:ident, $resume_phase:expr, $rollback_pos:expr) => {
+                let _sr = number_span(bits, buf_end, chunk_ptr, &mut scan_state);
+                bits = _sr.bits;
+                chunk_ptr = _sr.chunk_ptr;
+                let $out_end = _sr.end;
+                if _sr.status == SpanStatus::Truncated {
+                    suspend_at!($resume_phase, $rollback_pos);
+                }
+            };
+        }
         macro_rules! phase_root_value {
             () => {{
                 let ch = next_structural!();
@@ -1168,4 +1137,15 @@ pub unsafe fn parse<R: Reactor>(ctx: &mut Ctx, reactor: &mut R) {
             _ => core::hint::unreachable_unchecked(),
         }
     } // 'dispatch loop
+
+    // Shared exit — single copy of ctx save sequence.
+    ctx.cur_pos = cur_pos;
+    ctx.chunk_ptr = chunk_ptr;
+    ctx.structural_bits = bits;
+    ctx.scan_state = scan_state;
+    ctx.depth = depth;
+    ctx.exit_code = exit_code;
+    if error_pos != u32::MAX {
+        ctx.error_pos = error_pos;
+    }
 }
