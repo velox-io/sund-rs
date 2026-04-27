@@ -11,4 +11,7 @@ repository.workspace = true
 default = ["std"]
 std = []
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(force_generic)'] }
+
 [dependencies]

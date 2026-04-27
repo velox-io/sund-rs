@@ -332,19 +332,9 @@ fn test_string_length_sweep_1_to_256() {
         let json = format!("[{}]", val);
         let mut r = CollectReactor::new();
         let code = parse_all(json.as_bytes(), &mut r);
-        assert_eq!(
-            code,
-            ExitCode::Ok as i32,
-            "failed for string length {}",
-            n
-        );
+        assert_eq!(code, ExitCode::Ok as i32, "failed for string length {}", n);
         match &r.events[2] {
-            Event::Str(s) => assert_eq!(
-                s.len(),
-                n,
-                "string content length mismatch at n={}",
-                n
-            ),
+            Event::Str(s) => assert_eq!(s.len(), n, "string content length mismatch at n={}", n),
             other => panic!("expected Str at n={}, got {:?}", n, other),
         }
     }
@@ -358,19 +348,9 @@ fn test_key_length_sweep_1_to_256() {
         let json = format!(r#"{{"{}":{}}}"#, key_content, 1);
         let mut r = CollectReactor::new();
         let code = parse_all(json.as_bytes(), &mut r);
-        assert_eq!(
-            code,
-            ExitCode::Ok as i32,
-            "failed for key length {}",
-            n
-        );
+        assert_eq!(code, ExitCode::Ok as i32, "failed for key length {}", n);
         match &r.events[1] {
-            Event::Field(s) => assert_eq!(
-                s.len(),
-                n,
-                "key content length mismatch at n={}",
-                n
-            ),
+            Event::Field(s) => assert_eq!(s.len(), n, "key content length mismatch at n={}", n),
             other => panic!("expected Field at n={}, got {:?}", n, other),
         }
     }
@@ -470,7 +450,11 @@ fn test_escaped_quote_at_chunk_boundary() {
     assert_eq!(code, ExitCode::Ok as i32);
     match &r.events[2] {
         Event::Str(s) => {
-            assert_eq!(s.len(), 150, "escaped quote at chunk boundary should not truncate");
+            assert_eq!(
+                s.len(),
+                150,
+                "escaped quote at chunk boundary should not truncate"
+            );
         }
         other => panic!("expected Str, got {:?}", other),
     }
@@ -487,10 +471,14 @@ fn test_multiple_long_strings_in_object() {
     let mut r = CollectReactor::new();
     let code = parse_all(json.as_bytes(), &mut r);
     assert_eq!(code, ExitCode::Ok as i32);
-    let strs: Vec<&str> = r.events.iter().filter_map(|e| match e {
-        Event::Str(s) => Some(s.as_str()),
-        _ => None,
-    }).collect();
+    let strs: Vec<&str> = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(strs.len(), 3);
     assert_eq!(strs[0].len(), 100);
     assert_eq!(strs[1].len(), 150);
@@ -499,15 +487,22 @@ fn test_multiple_long_strings_in_object() {
 
 #[test]
 fn test_multiple_long_strings_in_array() {
-    let vals: Vec<String> = (60..=200).step_by(10).map(|n| make_long_string(n)).collect();
+    let vals: Vec<String> = (60..=200)
+        .step_by(10)
+        .map(|n| make_long_string(n))
+        .collect();
     let json = format!("[{}]", vals.join(","));
     let mut r = CollectReactor::new();
     let code = parse_all(json.as_bytes(), &mut r);
     assert_eq!(code, ExitCode::Ok as i32);
-    let strs: Vec<usize> = r.events.iter().filter_map(|e| match e {
-        Event::Str(s) => Some(s.len()),
-        _ => None,
-    }).collect();
+    let strs: Vec<usize> = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Str(s) => Some(s.len()),
+            _ => None,
+        })
+        .collect();
     let expected: Vec<usize> = (60..=200).step_by(10).collect();
     assert_eq!(strs, expected);
 }
@@ -559,7 +554,9 @@ struct EscapeCheckReactor {
 
 impl EscapeCheckReactor {
     fn new() -> Self {
-        Self { strings: Vec::new() }
+        Self {
+            strings: Vec::new(),
+        }
     }
 }
 
@@ -584,7 +581,10 @@ fn test_long_string_has_escape_flag() {
     let mut r = EscapeCheckReactor::new();
     parse_all(json.as_bytes(), &mut r);
     assert_eq!(r.strings.len(), 1);
-    assert!(!r.strings[0].1, "150-byte string without escapes should have has_escape=false");
+    assert!(
+        !r.strings[0].1,
+        "150-byte string without escapes should have has_escape=false"
+    );
 
     // With escape: has_escape should be true.
     let val_esc = make_escaped_string(150, &[75]);
@@ -592,7 +592,10 @@ fn test_long_string_has_escape_flag() {
     let mut r = EscapeCheckReactor::new();
     parse_all(json.as_bytes(), &mut r);
     assert_eq!(r.strings.len(), 1);
-    assert!(r.strings[0].1, "150-byte string with escape should have has_escape=true");
+    assert!(
+        r.strings[0].1,
+        "150-byte string with escape should have has_escape=true"
+    );
 }
 
 #[test]
@@ -603,7 +606,10 @@ fn test_long_string_has_escape_across_chunks() {
     let json = format!(r#"[{}]"#, esc);
     let mut r = EscapeCheckReactor::new();
     parse_all(json.as_bytes(), &mut r);
-    assert!(r.strings[0].1, "escape in second chunk should set has_escape");
+    assert!(
+        r.strings[0].1,
+        "escape in second chunk should set has_escape"
+    );
 }
 
 struct SkipFieldReactor {

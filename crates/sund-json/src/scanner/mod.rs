@@ -6,7 +6,10 @@
 //! - aarch64: NEON + PMULL  (neon.rs, always inlined)
 //! - x86-64:  AVX2 + PCLMULQDQ (avx2.rs, inlined when compiled with
 //!   `-C target-cpu=native`; real call otherwise)
-//! - fallback: scalar byte-by-byte classification (generic.rs)
+//! - fallback: SWAR scalar classification (generic.rs)
+//!
+//! Debug: compile with `--cfg force_generic` to bypass all SIMD paths
+//! and use the generic fallback on any platform.
 
 use crate::types::ScanState;
 
@@ -116,15 +119,18 @@ pub fn ctz64_empty(v: u64, out_idx: &mut u32) -> bool {
 /// - fallback: shift-XOR cascade
 #[inline(always)]
 pub fn prefix_xor(v: u64) -> u64 {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(force_generic)))]
     {
         unsafe { neon::prefix_xor_neon(v) }
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(force_generic)))]
     {
         unsafe { avx2::prefix_xor_x86(v) }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(any(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        force_generic
+    ))]
     {
         generic::prefix_xor_generic(v)
     }
@@ -138,15 +144,18 @@ pub fn prefix_xor(v: u64) -> u64 {
 /// `buf` must point to at least 64 readable bytes.
 #[inline(always)]
 pub unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(force_generic)))]
     {
         neon::classify_chunk(buf)
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(force_generic)))]
     {
         avx2::classify_chunk(buf)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(any(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        force_generic
+    ))]
     {
         generic::classify_chunk(buf)
     }

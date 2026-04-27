@@ -292,8 +292,10 @@ fn bench_parse(json: &[u8]) {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let run_base = args.iter().any(|a| a == "base") || (!args.iter().any(|a| a == "parse" || a == "minimal"));
-    let run_parse = args.iter().any(|a| a == "parse") || (!args.iter().any(|a| a == "base" || a == "minimal"));
+    let run_base =
+        args.iter().any(|a| a == "base") || (!args.iter().any(|a| a == "parse" || a == "minimal"));
+    let run_parse =
+        args.iter().any(|a| a == "parse") || (!args.iter().any(|a| a == "base" || a == "minimal"));
     let run_minimal = args.iter().any(|a| a == "minimal");
 
     let (json, path) = load_payload();
@@ -317,7 +319,6 @@ fn main() {
         bench_minimal(&json);
     }
 }
-
 
 /// Minimal reactor for measuring dispatch overhead.
 struct MinimalReactor {

@@ -27,7 +27,10 @@ use core::arch::x86_64::*;
 /// Requires x86-64 with SSE2 and PCLMULQDQ support.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(target_feature = "avx2", inline(always))]
-#[cfg_attr(not(target_feature = "avx2"), target_feature(enable = "sse2,pclmulqdq"))]
+#[cfg_attr(
+    not(target_feature = "avx2"),
+    target_feature(enable = "sse2,pclmulqdq")
+)]
 pub(crate) unsafe fn prefix_xor_x86(v: u64) -> u64 {
     let x = _mm_set_epi64x(0, v as i64);
     let ones = _mm_set_epi64x(0, -1i64);
