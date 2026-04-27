@@ -3,21 +3,14 @@
 //! Produces 64-bit structural bitmaps from 64-byte input chunks.
 //! Algorithm: classify → escape resolution → string mask → merge.
 //!
-//! Platform selection uses `cfg(target_feature)` at the module level so
-//! that platform-specific files contain **no** per-function
-//! `#[target_feature]` annotations — every function can be
-//! `#[inline(always)]` without conflict.
-//!
-//! - aarch64:                NEON + PMULL  (neon.rs)
-//! - x86-64 with avx2 flag: AVX2 + PCLMULQDQ (avx2.rs)
-//! - everything else:       scalar fallback  (generic.rs)
-//!
-//! To enable the AVX2 path, compile with `-C target-feature=+avx2,+pclmulqdq`
-//! or `-C target-cpu=native`.
+//! - aarch64: NEON + PMULL  (neon.rs, always inlined)
+//! - x86-64:  AVX2 + PCLMULQDQ (avx2.rs, inlined when compiled with
+//!   `-C target-cpu=native`; real call otherwise)
+//! - fallback: scalar byte-by-byte classification (generic.rs)
 
 use crate::types::ScanState;
 
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 mod avx2;
 mod generic;
 #[cfg(target_arch = "aarch64")]
@@ -125,18 +118,13 @@ pub fn ctz64_empty(v: u64, out_idx: &mut u32) -> bool {
 pub fn prefix_xor(v: u64) -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: On aarch64 we require NEON+AES (PMULL). The caller must
-        // ensure the target supports these features (always true on Apple
-        // Silicon; compile with +aes on other aarch64 targets).
         unsafe { neon::prefix_xor_neon(v) }
     }
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: PCLMULQDQ + SSE2 required. Compile with
-        // -C target-feature=+avx2,+pclmulqdq or -C target-cpu=native.
         unsafe { avx2::prefix_xor_x86(v) }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_feature = "avx2")))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         generic::prefix_xor_generic(v)
     }
@@ -154,11 +142,11 @@ pub unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
     {
         neon::classify_chunk(buf)
     }
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
     {
         avx2::classify_chunk(buf)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_feature = "avx2")))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         generic::classify_chunk(buf)
     }

@@ -3,14 +3,18 @@
 //! Uses a shuffle-LUT approach for byte classification.
 //! Also provides `prefix_xor_x86` via PCLMULQDQ (carry-less multiply).
 //!
-//! This entire module is gated by `cfg(target_feature = "avx2")` at the
-//! import site (`scanner/mod.rs`).  No per-function `#[target_feature]`
-//! is needed — the compiler already knows AVX2/PCLMULQDQ are available,
-//! so `#[inline(always)]` works without conflict.
+//! Inline strategy (via `cfg_attr`):
+//! - When the compiler globally has AVX2 (`-C target-cpu=native` or
+//!   `-C target-feature=+avx2`): `#[inline(always)]`, zero call overhead.
+//! - Otherwise: `#[target_feature(enable = ...)]` so the function body
+//!   can use AVX2 intrinsics, but pays a real `call` per invocation
+//!   (Rust forbids combining `target_feature` with `inline(always)`).
 
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use super::ChunkClass;
+
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
 /// Compute prefix-XOR using `_mm_clmulepi64_si128` (PCLMULQDQ).
@@ -21,7 +25,9 @@ use core::arch::x86_64::*;
 /// # Safety
 ///
 /// Requires x86-64 with SSE2 and PCLMULQDQ support.
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(target_feature = "avx2", inline(always))]
+#[cfg_attr(not(target_feature = "avx2"), target_feature(enable = "sse2,pclmulqdq"))]
 pub(crate) unsafe fn prefix_xor_x86(v: u64) -> u64 {
     let x = _mm_set_epi64x(0, v as i64);
     let ones = _mm_set_epi64x(0, -1i64);
@@ -35,7 +41,9 @@ pub(crate) unsafe fn prefix_xor_x86(v: u64) -> u64 {
 ///
 /// `buf` must point to at least 64 readable bytes.
 /// Requires x86-64 with AVX2 support.
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(target_feature = "avx2", inline(always))]
+#[cfg_attr(not(target_feature = "avx2"), target_feature(enable = "avx2"))]
 pub(crate) unsafe fn classify_chunk(buf: *const u8) -> ChunkClass {
     let v0 = _mm256_loadu_si256(buf as *const __m256i);
     let v1 = _mm256_loadu_si256(buf.add(32) as *const __m256i);
