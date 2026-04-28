@@ -37,12 +37,15 @@ fn parse_digit(c: u8, acc: &mut u64) -> bool {
 
 /// Slow path: parse via `str::parse::<f64>()`.
 fn parse_double_fallback(src: &[u8]) -> f64 {
-    // NUL-terminate in a small buffer.
-    let mut buf = [0u8; 64];
     let n = src.len().min(63);
-    buf[..n].copy_from_slice(&src[..n]);
-    let s = std::str::from_utf8(&buf[..n]).unwrap_or("0");
-    s.parse::<f64>().unwrap_or(0.0)
+    let mut buf = std::mem::MaybeUninit::<[u8; 64]>::uninit();
+    let ptr = buf.as_mut_ptr() as *mut u8;
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, n);
+        // JSON numbers are always ASCII, skip from_utf8 validation.
+        let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, n));
+        s.parse::<f64>().unwrap_or(0.0)
+    }
 }
 
 /// Parse a validated JSON number span `src` into a `f64`.
